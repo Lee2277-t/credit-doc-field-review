@@ -1,0 +1,36 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: 契约测试（Windows）
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # 仓库不带合成语料（samples/ 与 labels/ 是 docpipe.synth 的生成物），
+      # 断言「随仓库发布的语料」的那几类测试会自动跳过，其余照常跑。
+      - name: 跑单元测试
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python -m unittest discover -s tests -q

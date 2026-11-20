@@ -1,5 +1,7 @@
 # 信贷资料字段复核台
 
+[![Tests](https://github.com/Lee2277-t/credit-doc-field-review/actions/workflows/tests.yml/badge.svg)](https://github.com/Lee2277-t/credit-doc-field-review/actions/workflows/tests.yml)
+
 在 Windows 上本地抽取信贷资料里的字段。点击字段可以定位到原文，逐项确认或修正，再下载包含结果表、离线查看页和复核流水的 ZIP。
 
 ## 快速体验

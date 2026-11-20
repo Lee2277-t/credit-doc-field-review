@@ -153,6 +153,16 @@ def _finger_shot(page: np.ndarray, color=(223, 177, 148)) -> np.ndarray:
     return array
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# 仓库不带合成语料：samples/ 与 labels/ 是 `python -m docpipe.synth --out samples` 的生成物，
+# 真实资料一律不进仓库。下面几类断言的对象正是「随仓库发布的这份语料」，
+# 语料不在时应当跳过，而不是让新克隆的人看到一片 FileNotFoundError。
+SHIPPED_CORPUS_MISSING = not (PROJECT_ROOT / "samples" / "manifest.json").is_file()
+needs_shipped_corpus = unittest.skipIf(
+    SHIPPED_CORPUS_MISSING, "仓库不带合成语料，先跑 python -m docpipe.synth --out samples"
+)
+
+
 class ValueMatchTests(unittest.TestCase):
     def test_identity_ignores_separators(self):
         spec = {"type": "string", "risk": "identity"}
@@ -6991,6 +7001,7 @@ class HoldoutIsolationTests(unittest.TestCase):
         self.assertIn('config["paths"]["labels"]', source)
 
 
+@needs_shipped_corpus
 class SampleFreezeTests(unittest.TestCase):
     """SCENARIO 第 109 行：样本清单冻结后不得原地修改；需要修改就新建版本号。"""
 
@@ -7051,6 +7062,7 @@ class SampleFreezeTests(unittest.TestCase):
             config = {"paths": {"samples": str(root / "samples"), "labels": str(root / "labels")}}
             info = samplefreeze.audit_split("dev", config)
         self.assertTrue(any(name.endswith("extra.pdf") for name in info["unlisted"]), info["unlisted"])
+@needs_shipped_corpus
 class EvaluationProvenanceTests(unittest.TestCase):
     """SCENARIO §9.3/§9.4：评估报告要带代码版本、配置哈希、样本清单哈希，并写明合成集局限。
 
@@ -7726,6 +7738,7 @@ class MatchingContractTests(unittest.TestCase):
 
 
 
+@needs_shipped_corpus
 class CorpusShapeTests(unittest.TestCase):
     """SCENARIO §9.1 的语料形状：少两格、整 split 全用文本层、流水砍短都必须点名。
 
@@ -8475,6 +8488,7 @@ class ScenarioContractTests(unittest.TestCase):
                          "logistic_regression_isotonic")
 
 
+@needs_shipped_corpus
 class LabelContractTests(unittest.TestCase):
     """SCENARIO §9.2：标注少一个键，评估器要么当场炸，要么静默记错。"""
 
