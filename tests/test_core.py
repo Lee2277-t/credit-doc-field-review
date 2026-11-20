@@ -18,7 +18,7 @@ import time
 import unittest
 import zipfile
 from unittest import mock
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -161,6 +161,20 @@ SHIPPED_CORPUS_MISSING = not (PROJECT_ROOT / "samples" / "manifest.json").is_fil
 needs_shipped_corpus = unittest.skipIf(
     SHIPPED_CORPUS_MISSING, "仓库不带合成语料，先跑 python -m docpipe.synth --out samples"
 )
+
+# 生成 PDF 的夹具要写中文，依赖 Windows 自带的宋体与黑体；没有这两份字体的机器
+# （CI runner、非 Windows）上这些用例只能跳过——它们验的不是产品逻辑本身。
+CJK_FONTS_PRESENT = Path("C:/Windows/Fonts/simsun.ttc").is_file() and Path(
+    "C:/Windows/Fonts/simhei.ttf"
+).is_file()
+needs_cjk_fonts = unittest.skipUnless(
+    CJK_FONTS_PRESENT, "需要 Windows 宋体/黑体：这些用例要现场生成带中文的 PDF"
+)
+
+# 导出契约要求时间戳带 +08:00，是业务口径而不是本机时区。别的时区上跑这条
+# 只会量到 runner 的时区，跳过并写明原因。
+LOCAL_TZ_IS_PLUS8 = datetime.now().astimezone().utcoffset() == timedelta(hours=8)
+needs_plus8_tz = unittest.skipUnless(LOCAL_TZ_IS_PLUS8, "这条断言假定本机时区是 +08:00")
 
 
 class ValueMatchTests(unittest.TestCase):
@@ -854,6 +868,7 @@ class ZipImportTests(unittest.TestCase):
             self.assertEqual([p.name for p in iter_inputs(root / "inbox", config)], ["甲.png"])
 
 
+@needs_cjk_fonts
 class IsolatedImportRegressionTests(unittest.TestCase):
     """只读配置与代码；原件、缓存、校准、台账和输出全部留在临时目录。"""
 
@@ -1983,6 +1998,7 @@ class CalibrationAugmentationTests(unittest.TestCase):
         self.assertAlmostEqual(block["brier"], 0.3067, places=4)
 
 
+@needs_cjk_fonts
 class TableRobustnessTests(unittest.TestCase):
     """P0 骨架：版面块辅助表格定位 + 合并单元格/列错位检测。"""
 
@@ -3130,6 +3146,7 @@ class PartialBorderTests(unittest.TestCase):
         self.assertTrue(partial)
 
 
+@needs_cjk_fonts
 class ReceiptEndToEndTests(unittest.TestCase):
     """两类票据用合成文本层 PDF 走完整解析 → 抽取 → 校验，不依赖真实样张。"""
 
@@ -3283,6 +3300,7 @@ class ReceiptEndToEndTests(unittest.TestCase):
         self.assertEqual(fields["cv.payment_number"]["decision"], "review")
 
 
+@needs_cjk_fonts
 class HardSetTests(unittest.TestCase):
     """P0-1 难例集：生成、双栏字段覆盖、按退化归因。"""
 
@@ -3446,6 +3464,7 @@ class HardSetTests(unittest.TestCase):
             self.assertEqual(shots[0], shots[1])
 
 
+@needs_cjk_fonts
 class SchemaCoverageTests(unittest.TestCase):
     def test_business_license_individual_operator_labels(self):
         """个体户执照的「经营者 / 组成形式 / 经营场所」要落到同名字段上。
@@ -7342,6 +7361,7 @@ class GroundingContractTests(unittest.TestCase):
 
 
 
+@needs_plus8_tz
 class DocContractTests(unittest.TestCase):
     """SCENARIO §8.1/§6.4：原因码三张表同源，单文档 JSON 也必须长成契约里的样子。
 
