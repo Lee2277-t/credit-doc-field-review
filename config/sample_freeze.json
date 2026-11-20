@@ -1,0 +1,23 @@
+{
+  "note": "样本冻结快照。SCENARIO 第 109 行：清单冻结后不得原地修改，需要修改就新建版本号。整批重生成后先升 `samples/*/manifest.json` 的 version，再跑 `python -m docpipe.samplefreeze --write` 登记新摘要。",
+  "splits": {
+    "dev": {
+      "version": 2,
+      "digest": "0b8bdb7d480fd851a49aa6ed39606c3169d02564b2083a465ecbe84a4c54ab25",
+      "documents": 10,
+      "previous": {"1": "991277538a4e7f27f677697b6fb84ea2517bc78b16ad52b36308b58871849163"}
+    },
+    "holdout": {
+      "version": 2,
+      "digest": "bd0d88964d8c3e5c33aee809795871f09044e655609f2d2558f7fb19f81e3d91",
+      "documents": 10,
+      "previous": {"1": "0a99223858d3f2851e73e4bddc27207deb367aa37338c5d43d044c2e7dfdd610"}
+    },
+    "hard": {
+      "version": 2,
+      "digest": "74c7aa5b4d98aacd7394ae45a6d7a2ceade0b6e9c7a848d6c275211044240818",
+      "documents": 30,
+      "previous": {"1": "3cda2c7550a3d6ee8c84b64f2e98b81d20edaea4a5fa53d572842b56e438aa83"}
+    }
+  }
+}

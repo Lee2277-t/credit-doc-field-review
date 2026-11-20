@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>信贷资料字段复核台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">信</span>
+      <div>
+        <h1>信贷资料字段复核台</h1>
+        <p>离线运行 · 字段可回溯原文</p>
+      </div>
+    </div>
+    <div class="run-stats" id="run-stats"></div>
+    <div class="top-actions">
+      <label class="workspace-picker">
+        <span>数据</span>
+        <select id="workspace-select"></select>
+      </label>
+      <button id="import-open" class="btn" type="button">导入资料</button>
+      <button id="report-open" class="btn" type="button">查看结果</button>
+      <button id="export-run" class="btn primary" type="button">导出结果</button>
+    </div>
+    <label class="doc-picker">
+      <span>当前文档</span>
+      <select id="doc-select"></select>
+    </label>
+  </header>
+
+  <div id="import-warning" class="import-warning" role="status" hidden>
+    <span id="import-warning-text"></span>
+    <button id="import-failures-open" class="btn" type="button">查看失败详情</button>
+  </div>
+
+  <main class="workspace">
+    <section class="viewer">
+      <div class="viewer-toolbar">
+        <div class="page-nav">
+          <button id="prev-page" type="button">上一页</button>
+          <span id="page-indicator">1 / 1</span>
+          <button id="next-page" type="button">下一页</button>
+        </div>
+        <div class="zoom">
+          <label for="zoom">缩放</label>
+          <input id="zoom" type="range" min="60" max="260" step="10" value="100">
+          <span id="zoom-label">100%</span>
+        </div>
+      </div>
+      <div class="stage" id="stage">
+        <div class="page-wrap" id="page-wrap">
+          <img id="page-image" alt="文档页面">
+          <div class="overlay" id="overlay"></div>
+        </div>
+        <div class="stage-empty" id="stage-empty">正在加载页面…</div>
+      </div>
+      <div class="viewer-hint" id="viewer-hint">↑↓ 切换 · N 下一待复核 · E 修正 · Ctrl+Enter 保存/通过 · / 搜索</div>
+    </section>
+
+    <aside class="panel">
+      <div class="doc-head" id="doc-head"></div>
+      <div class="panel-tools">
+        <div class="tabs" id="tabs">
+          <button data-tab="review" class="active">待复核 <span id="tab-review-count">0</span></button>
+          <button data-tab="all">全部字段 <span id="tab-all-count">0</span></button>
+          <button data-tab="done">已复核 <span id="tab-done-count">0</span></button>
+        </div>
+        <input id="search" type="search" placeholder="搜索字段名 / 原文 / 值 / 原因" aria-label="搜索字段" autocomplete="off">
+        <div class="review-tools">
+          <span id="field-search-count" role="status"></span>
+          <button id="next-review" class="btn" type="button" disabled title="快捷键 N">下一待复核</button>
+        </div>
+      </div>
+      <div class="field-list" id="field-list"></div>
+    </aside>
+  </main>
+
+  <dialog id="import-dialog">
+    <div class="dialog-card">
+      <div class="dialog-head">
+        <h3>导入资料</h3>
+        <button id="import-close" class="icon-btn" type="button" aria-label="关闭">×</button>
+      </div>
+      <p class="dialog-hint">PDF、图片、<b>.zip</b> 都可以，支持多选和整个文件夹。ZIP 会就地解开，只收能识别的文件。原件留在本机 <b>inbox/</b>，结果写入 <b>out/user/</b>。</p>
+      <label class="drop-zone" id="drop-zone">
+        <input id="file-input" type="file" accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.gif,.webp" multiple hidden>
+        <input id="folder-input" type="file" webkitdirectory directory multiple hidden>
+        <strong>点击选择文件</strong>
+        <span>或把文件、整个文件夹拖到这里</span>
+      </label>
+      <div class="dialog-sub">
+        <button id="folder-open" class="btn" type="button">选择整个文件夹</button>
+        <span id="folder-hint">单次最多 <b id="max-files">200</b> 个，超出的跳过</span>
+      </div>
+      <ul class="import-list" id="import-list"></ul>
+      <section id="import-failures" class="import-failures" hidden aria-label="解析失败的资料"></section>
+      <progress id="import-progress" aria-label="导入进度" hidden></progress>
+      <div class="import-status" id="import-status" role="status" aria-live="polite"></div>
+      <div class="dialog-actions">
+        <button id="import-cancel" class="btn" type="button">取消</button>
+        <button id="import-start" class="btn primary" type="button" disabled>开始导入</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

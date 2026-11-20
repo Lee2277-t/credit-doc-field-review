@@ -1,0 +1,51 @@
+# ---- 私有资料与运行产物：不随公开仓库分发 ----
+# 上传的原始件、用户工作区输出、解析缓存/评估报告/交付包/回收站
+/inbox/
+/out/
+/work/*
+# 仅保留锚点维护工具，其余 work/ 内容都是可重建的运行产物
+!/work/anchor_sync.py
+# 合成语料与标注可从 README 的生成命令重建
+/samples/
+/labels/
+/查看结果.html
+/交接文档.md
+/private/
+*.[pP][dD][fF]
+*.[cC][sS][vV]
+*.[tT][sS][vV]
+*.[xX][lL][sS]
+*.[xX][lL][sS][xXmM]
+*.[dD][oO][cC]
+*.[dD][oO][cC][xXmM]
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[bB][mM][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[gG][iI][fF]
+*.[wW][eE][bB][pP]
+*.[zZ][iI][pP]
+!/docs/review-demo.png
+
+# ---- 本机工作记录与凭据 ----
+/.workbuddy/
+/.qoder/
+.env
+.env.*
+*.pem
+*.key
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 临时与日志 ----
+*.log
+*.bak.md
+work/runtime.json

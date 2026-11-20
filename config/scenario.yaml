@@ -1,0 +1,1335 @@
+version: 1
+scenario: small_business_credit_review
+
+paths:
+  samples: samples
+  labels: labels
+  work: work
+  out: out
+  # 用户上传的原始 PDF 与处理结果，和示例/验收数据分开存放。
+  inbox: inbox
+  # SCENARIO 第 108 行：留出集标签只许评估脚本读。写在这份名单上的 split 不参与任何
+  # 拟合——`docpipe.calibrate` 在黑名单上直接拒训，否则留出指标会被自己刷高。
+  evaluation_only_splits: [holdout]
+  user_out: out/user
+
+parsing:
+  render_dpi: 300
+  # OCR 后端的选择权在配置里，不在代码里：这个键现在真的被消费（docpipe/ocr.py 按它取引擎）。
+  #   rapidocr —— 出厂默认，CPU + onnxruntime，随离线包分发。
+  #   null     —— 什么都不读（诊断用）：其余环节照常跑，用来量「交付物里有多少来自 OCR」，
+  #               换任何后端都以此为基线定价，不是拿来上生产的。
+  # 写了没注册的名字直接报错并列出可选值，绝不悄悄退回 rapidocr——退回会让指标看着正常、
+  # 实际读的是别的东西。加新引擎 = 在 docpipe/ocr.py 注册一个类，parse.py 不用改。
+  # 解析记录里每页的 engine 就是这次用的引擎名，所以换引擎不需要升 PARSER_VERSION、
+  # 也不会让 work/parsed 的缓存整体失效（默认引擎下产出的 JSON 与改名前逐字相同）。
+  ocr_engine: rapidocr
+  # 文本层与表格引擎的选择同样在配置里（SCENARIO §13）。目前各只有一个已注册实现，
+  # 写未注册的名字直接报错并列出可选值——绝不悄悄退回默认，退回会让指标看着正常、
+  # 实际跑的是另一条通路。加实现 = 在 parse.py 的注册表里加名字并实现对应取法。
+  pdf_text_engine: pymupdf
+  table_engine: pdfplumber
+  # SCENARIO §12.2 的第二条表格通路：PyMuPDF 的 find_tables 只用来对账（表框/行数/列数），
+  # 不参与取数也不改判决。两家给出的表框 IoU 低于这个值即记 bbox_off。
+  table_crosspath:
+    bbox_min_iou: 0.98
+  text_density_threshold: 40
+  # 整页解析质量分（parse_score）低于该值时，这份文档的字段记 PARSE_LOW_QUALITY。
+  # 与下面的 page_quality 是两根不同的轴：这条量「文字层解析得干不干净」，
+  # page_quality 量「栅格像素够不够」。改这里只会移动复核数量，不会改判据本身。
+  min_page_quality: 0.5
+  # SCENARIO §3.1 / §7.1 的坐标契约：块和单元格的 bbox 必须落在页面内，偏出页边超过这个值（点）的结果被丢弃并记 GROUNDING_MISSING。
+  # 它是解析层丢弃与字段层判决共用的唯一容差：两层读同一个键，
+  # 改这里会同时移动两道门。
+  grounding:
+    tolerance_pt: 1.0
+  # 文档类型判定：把 doc_types.*.keywords 的权重按命中次数加权求和，最高分必须同时过
+  # 「绝对分」与「与第二名的差距」两道门，否则整份判 UNKNOWN、一个字段都不抽。
+  # 这两个数过去硬写在 parse.py 里（3 与 1），改不动——铁律「阈值全外置」漏网的最后一处判决。
+  # 置信度只用来看与排，不参与任何自动接受：base + per_point × 最高分，封顶 cap。
+  doc_type:
+    min_score: 3
+    min_margin: 1
+    confidence_base: 0.55
+    confidence_per_point: 0.04
+    confidence_cap: 0.99
+  # 扫描件的有效采样密度：渲染到 300dpi 再 OCR 不会把 120dpi 的糊字变清楚。
+  # 只衡量页面实际带了多少像素，与文档类型无关；低于阈值的整页字段强制复核。
+  page_quality:
+    enabled: true
+    # 图片相对页面的最小占比；更小的图是 logo、水印，不是这页的正文来源。
+    min_coverage: 0.5
+    # 按 PDF 点（1/72 英寸）换算出的有效 dpi 低于该值即判为低分辨率。
+    # 120dpi 的难例会被拦下；170dpi 的重度 JPEG 仍由 JPEG 噪声本身负责。
+    min_effective_dpi: 150
+    # 图片导入生成的 PDF 是一像素一点，页面尺寸不代表物理纸张；
+    # 这类页面按 A4（210×297mm）折算有效 dpi。
+    a4_short_inches: 8.27
+    a4_long_inches: 11.69
+    # 按字段风险分级的分辨率档位，默认关闭：关着就是 P0-5 的「整页一刀切」，
+    # 页面被判低分辨率时该页所有字段一律复核。
+    # 打开后，每个风险档从这里读自己要求的最低有效 dpi：低于自己档位的字段才进复核，
+    # 没列出的风险档按 default（缺省 = min_effective_dpi）。档位数字必须由
+    # `python -m docpipe.hardset sweep` 生成的 work/eval/resolution_sweep.json 决定，
+    # 不能拍脑袋填，也不能为了少复核几个字段往低调。
+    # 2026-10-25 的 6×2 扫描（dpi 120..300 × JPEG 55/85，48 份退化件，
+    # work/eval/resolution_sweep.json）结论是「没有任何一档能在门槛以下放行」：
+    # 门槛 150，实测低于 150 的只有 120.1 一格，而那格 date/identity/free_text/
+    # optional_low_risk 的放回错值率是 0.45/0.64/0.71/0.67；唯一零错值的 monetary
+    # 只有 19 项、Wilson 下界 0.832（等于给金额留 17% 静默错误），party_name 与 count
+    # 各 5/3 项不构成证据。120 的 JPEG 85 那一格几乎全绿，但门只看 dpi、看不出 JPEG 质量，
+    # 放到 120 会连带放行 JPEG 55。真实资料需另行评估。
+    # 所以保持关闭 = 维持整页一刀切；要重新定档，先重跑 sweep 再谈。
+    risk_min_dpi:
+      enabled: false
+  # 跨页表格续接：续页没有表头时，只有上一页表格贴底到该比例才当作续页处理，
+  # 避免把"本页只有小表格"的页面误接成上一张表的尾巴。
+  continuation_min_bottom_ratio: 0.55
+  # 续页行聚合容差 = 行高中位数 × 该系数，且不低于下面的像素下限。
+  continuation_row_tolerance: 0.7
+  continuation_row_min_tolerance: 6.0
+  # 列匹配在列半径之外额外允许的像素余量，超出即丢弃该片段。
+  continuation_column_slack: 30
+  # 版面块辅助表格定位（P0 骨架）：用 pymupdf 自带版面模型（离线，约 0.3 秒/页）
+  # 先把页面切成「这一块是表格」，表头锚点与数据行只在同一块内找，一页两张表、
+  # 表格上下的无关文字不再互相污染。模型找不到表格块时整块回退到整页行为。
+  # 注意：版面模型只在文本层页面上产出块；纯图片扫描页返回空（走整页回退），
+  # 无框线纯文字的表格也可能被标成 text 块，所以默认关闭，待 P0-1 难例集评估后再定。
+  layout:
+    enabled: false
+    # 片段与版面块的重叠面积占片段面积的比例达到该值，才算「落在这个块里」。
+    block_overlap_ratio: 0.35
+    # 相邻表格块（如表头块与表体块）间距不超过该值就合并成同一张表。
+    block_merge_gap: 6
+  # 合并单元格/列错位检测（P0 骨架）：只检测、标记、进复核，绝不自动还原。
+  table_anomaly:
+    enabled: true
+    # 片段高度达到行高中位数的该倍数且横跨至少两行 → 疑似跨行合并单元格。
+    min_height_ratio: 1.6
+    # 表格纵向范围向外放宽的余量（pt）：更远的页脚、页眉、表格下方合计块不算异常。
+    vertical_slack: 8
+    # 片段置信度低于该值的当 OCR 噪点忽略，不当作列错位证据。
+    min_confidence: 0.5
+    # 横向并框：一个框越过相邻声明列的中心，而那一列在本行是空的 → 疑似两列被 OCR 并成一框
+    # （数电发票的「项目名称/规格型号」之间没有竖线，64~150dpi 上经常并成一框）。
+    # 只标记进复核，绝不按比例拆：拆错了就是"看起来很确定的错值"。
+    detect_column_merge: true
+    # 框边越过相邻列中心多少 pt 以内算"刚好压线"，不计为并框证据（pt）。
+    column_merge_slack: 2.0
+  # 离线二维码校验：只对配置了 qr 块的票据类型解码，载荷字段映射写在该类型的 qr.fields 里。
+  # 二维码是打印在票面上的第二份原文，不依赖 OCR，结果只用于「补空/核对」，冲突一律进复核。
+  qr:
+    enabled: true
+    # 解码用 200dpi 渲染图：再低小二维码会糊，再高只增加耗时。
+    dpi: 200
+    delimiter: ","
+  # OCR 标签行右侧补读：整页 OCR 的文字检测器会漏掉孤立的单字（实测 300dpi 的
+  # 扫描件上「未结清贷款笔数：4」里的 4 整页读不到，裁出右侧空白后 0.999 读到）。
+  # 只对「整行以冒号结尾、右侧为空」的标签行补读，只接受单框、短、无冒号、
+  # 置信度达标的文本；补出来的值一律带 LOCAL_RECROP 进复核，不自动接受。
+  ocr_recrop:
+    enabled: true
+    # 裁切区放大到 400dpi 再识别：孤立字符在整页 300dpi 里太小，裁切后需要更多像素。
+    dpi: 400
+    min_confidence: 0.55
+    max_chars: 24
+    # 多框说明裁切区里混进了别的内容（相邻字段、表格线文字），整组弃权。
+    max_parts: 1
+    # 从标签右边缘向右最多裁多远（pt），再远就可能跨到下一列。
+    max_gap: 160
+    gap_pad: 2
+    vertical_pad: 0.25
+    # 每页最多补读这么多个标签，避免异常页把 OCR 时间拖长。
+    max_per_page: 8
+    separator_chars: ["：", ":"]
+
+thresholds:
+  global_min_confidence: 0.90
+  risk_tiers:
+    identity: 0.95
+    party_name: 0.96
+    date: 0.95
+    monetary: 0.97
+    count: 0.95
+    enum_flag: 0.95
+    free_text: 0.95
+    optional_low_risk: 0.93
+  field_overrides: {}
+
+validation:
+  low_ocr_threshold: 0.60
+  # SCENARIO §8.1 要求 review_reasons 用 §6.4 的原因码；这些是本项目在 §6.4 之外
+  # 追加、且已在 README 里逐条写过的原因码（登记后 docaudit 才放行，§6.4 直接收录即自动报过期）。
+  review_reason_extensions: [ENUM_UNKNOWN, LINE_FALLBACK, LOCAL_RECROP, LOW_CONFIDENCE,
+                             LOW_RESOLUTION, MATRIX_FALLBACK, PLACEHOLDER_EMPTY, QR_CONFLICT,
+                             RAW_UNVERIFIED, SEAL_OVERLAP, SIGN_INFERRED, TABLE_ANOMALY]
+  # SCENARIO §6.1 列了七个信号；业务上额外的信号在这里登记，§6.1 直接收录后登记自动过期。
+  signal_extensions: [raw_grounded]
+  balance_tolerance: 0.01
+  accounting_tolerance: 1.00
+  # 万元表按 0.01 万元显示，每个金额项最多带 ±50 元舍入误差。
+  accounting_tolerance_wan_per_term: 50
+  # 发票/缴款书的税额换算：单价×数量、完税价格×税率、行税额求和允许的分角误差。
+  # 6,679,515.08×13%=868,336.9604，票面按分四舍五入为 868,336.96，差额 0.0004。
+  tax_tolerance: 0.05
+  # 数电发票二维码与 OCR、海关缴款书号码与报关单编号的交叉核对。
+  review_on_qr_conflict: true
+  customs_number_match: true
+  # 号码类字段的格式（去除空格与连字符后按全匹配校验）。
+  code_patterns:
+    TAX_ID: '[0-9A-Z]{15,20}'
+    INVOICE_NO: '[0-9]{8,32}'
+    PAYMENT_NO: '[0-9]{10,32}(?:[A-Z][A-Z0-9]{0,7})?'
+    DECLARATION_NO: '[0-9]{10,32}'
+    APPLICATION_NO: '[0-9]{6,20}'
+    BILL_NO: '[A-Z0-9]{8,32}'
+    HS_CODE: '[0-9]{8,13}'
+  transaction_date_slack_days: 3
+  max_chain_failure_ratio: 0.10
+  # SCENARIO §5.2 V-BS-07：交易笔数必须等于页面上保留下来的数据行数，重复表头/页脚
+  # 行不得计入。解析层每丢掉一行都记原因，这些原因算「可证明不是真交易」，其余（认
+  # 不出是什么的行、首列日期读坏的行）一律点名到页、该页交易字段全部复核。页脚关键词
+  # 只用来给丢弃行归类，不参与任何金额或日期判断。
+  row_accounting:
+    benign_skip_reasons: [blank, header, footer, missing_required]
+    footer_keywords: ["合计", "小计", "本页", "共", "承前", "过次", "余额:", "备注"]
+    # 页脚/汇总行是稀疏的合并行：最多这么多格有字才算页脚。少了这条限制，摘要里带
+    # 「合计」两字的真交易行会被当成页脚放行——丢一笔真交易比多复核一页更贵。
+    footer_max_cells: 2
+  # SCENARIO §5.3 V-IS-05 与 §5.4 V-X-04 比的是同一对日期：利润表期末 vs 征信查询日。
+  # 查询日早于期末＝报表还没出就被引用；相差超过 stale_months 个月＝拿旧报表审今天的主体。
+  # 两条都是 warn、契约都没写「复核」，所以不另加复核门槛；它们把参与比对的格子判成
+  # cross_field_score 0.3（§6.1 的 warn 语义），掉不掉出自动接受交给那张阈值表。
+  statement_recency:
+    severity: warn
+    stale_months: 18
+    future_tolerance_days: 0
+    # 契约 V-IS-05 点名「期间与净利润置信度降级」：降级对象写在这里，代码不另挑。
+    degraded_paths: [is.statement_period_start, is.statement_period_end, is.net_profit]
+  # SCENARIO §5.3 V-IS-04 后半句：本期列与上期列不得混列。列身份唯一能自证的东西是
+  # 金额框的横向位置——同一页按字段声明的期间列聚中位线，落在另一列带里的数就是混列；
+  # 两列中位线近到分不开就是无法确认。两种情形契约只给一个去处：全部金额复核。
+  income_columns:
+    enabled: true
+    table: income
+    period_columns: [本期金额, 上期金额]
+    # 两列中位线相距不到这么多点：版面已分不开谁是谁，按「无法确认」处理。
+    min_column_gap: 12.0
+    # 金额框离另一列的中位线至少近这么多点，才敢判「混列」；否则只算说得通的两可。
+    assignment_margin: 6.0
+  # SCENARIO §4.5 is.income_tax 的硬校验「≥ 0；≤ 利润总额（软）」后半句：所得税
+  # 费用高过利润总额，通常是税格或利润总额读错；亏损弥补、汇算清缴退税时也可能
+  # 真出现，所以只把这一格判 warn（§6.1 的 0.3），不阻断；亏损表的所得税本来就是
+  # 0，只在利润总额为正时比较。容差沿用万元表舍入。
+  income_tax_ceiling:
+    enabled: true
+    severity: warn
+  # 表格抽取字段（table_cell / table_row）与列头/行标签模板的匹配分低于该值时记
+  # TEMPLATE_MISMATCH：表格认错了，格子里的数就不可信。评估层做错误归因时读同一个数，
+  # 所以调这里不会让「判据」和「归因」分家。
+  min_table_score: 0.5
+  # 只有这些字段的取值不可能晚于今天；营业期限截止日等允许在未来。
+  future_date_paths:
+    - bl.establishment_date
+    - bl.issue_date
+    - cr.query_date
+    - bs.period_end
+    - is.statement_period_end
+    - vi.invoice_date
+    - cv.issue_date
+  future_date_slack_days: 0
+  # 金额符号由借贷方向推断（原 OCR 未见负号）时必须人工确认。
+  review_on_inferred_sign: true
+  # 字段取值与彩色印章位置重叠超过该面积比例时强制复核：印章抑制只是让 OCR 认得出，
+  # 章底下的字迹本身仍然被遮挡，不能拿增强后的分数自动接受。
+  review_on_seal_overlap: true
+  seal_overlap_ratio: 0.15
+  # 表格里发现疑似合并单元格/列错位片段（见 parsing.table_anomaly）时，
+  # 受影响行的字段强制复核，不做自动还原。
+  review_on_table_anomaly: true
+  # 没有「项目/本期金额/上期金额」表头的年报版式按行名+年份列对齐逐行读取。
+  # 值有精确坐标和跨字段校验，但没有表头覆盖与框线证据；先强制复核，
+  # 积累真实标注后再决定是否放行。
+  review_on_line_fallback: true
+  # 征信报告的重表头矩阵：值来自「区块标题 + 表头序列 + 重复列名 + 合计行」的
+  # 结构对齐，没有逐格框线，单位还要靠报告说明折算。先强制复核。
+  review_on_matrix_fallback: true
+  # OCR 整页漏掉、靠裁切右侧空白补读出来的值：视觉来源仍是原文，但识别路径
+  # 没有整页上下文，先强制复核。
+  review_on_local_recrop: true
+  # 页面栅格分辨率低于 parsing.page_quality.min_effective_dpi 时，
+  # 该页所有字段强制复核：放大的糊字能被 OCR「自信地」读错。
+  review_on_low_resolution: true
+  # 同一字段的两条互不依赖通路取到不同值（见 validation.extractor_crosscheck）。
+  # 只记证据、不猜谁对——两条通路都可能是错的，人来看。
+  review_on_extractor_conflict: true
+  # 双通路交叉核对：SCENARIO.md 把 EXTRACTOR_CONFLICT 列为硬性原因，所以它必须真的能触发。
+  # alternates 声明「哪条主通路对哪条备选通路」；两条必须来源不同，否则是自我作证。
+  # line_cell：表格引擎把片段塞进框格，这条只按「行名片段 + 列 x 窗口内唯一数字」取数，
+  #           两套分配规则独立，串行/漏格/列错位在这里对不上。
+  # statement_line：年报版式按年度列头右边缘取行（只有配了 line_fallback 的表能作证）。
+  # declared_fallback：label_value 主通路 vs 字段自己声明的 fallback 通路。
+  # tolerance_* 只作用于数值型字段，避免格式化/单位换算尾差被当成冲突。
+  extractor_crosscheck:
+    # 2026-10-26 实测放行：dev/holdout/hard 三个标注集 50 份文档里 215 个可比字段全部一致，
+    # 零误复核；在 180dpi 退化件上抓到 2 处表格引擎把「823.69 228,」当成一个值、
+    # 按列序读到的却是「228,」的行，TABLE_ANOMALY 没报，这条报了。
+    enabled: true
+    alternates:
+      - primary: table_row
+        alternate: line_cell
+      - primary: table_row
+        alternate: statement_line
+      - primary: label_value
+        alternate: declared_fallback
+    tolerance_absolute: "0.01"
+    tolerance_relative: "0.0001"
+  # 编造率回查：字段声称读到的原文，必须在解析层已见过的字符里逐字出现（去空白后）。
+  # 这是不需要标注的客观口径——没出现过就不是读来的。判定故意宽松：允许命中同文档
+  # 其他页（跨页表格续列），min_chars 以下的空原文交给 REQUIRED_EMPTY/GROUNDING_MISSING。
+  # 原文回查判定「声称读到的字在页面上找不到」时强制复核：这是编造信号，
+  # 不是排版问题，没有任何阈值能把它降级。出厂语料 dev/holdout 实测 0 命中，
+  # 打开不改变指标；真实件上命中一次就该有一次人工确认。
+  raw_text_audit:
+    enabled: true
+    min_chars: 2
+  review_on_raw_unverified: true
+  # SCENARIO §4.1 规则 2：「必填字段为空、为 -- 、*** 、无 等占位符，判错」。
+  # 整格只印了这些符号时它不是一个值：必填按空判错（REQUIRED_EMPTY），可选的也交人确认
+  # （PLACEHOLDER_EMPTY）——「纸上就是没有」这句话由人下结论，机器只负责别把符号当值。
+  # 只做整格相等比较：「生产--销售」这种词内出现不动。新增符号改这里，代码里不认字面量。
+  placeholders: ["-", "--", "—", "***", "无", "不适用", "/", "空"]
+  review_on_placeholder: true
+  # SCENARIO §4.6 把三面标志的硬校验写成「未知则复核」：抽取侧把「未知 / 不详 / -」
+  # 归一成枚举值 unknown，V-ID-07 会放行（它确实是配置里认的词），于是「文件自己说
+  # 不知道」的标志可以自动接受——呆账读成 unknown 与读成「无」在审查里是两件事。
+  # 哪些枚举值必须交人确认按枚举名点名，代码里不认字面量。
+  enum_review_values:
+    flag: [unknown]
+  # 拒绝契约的「怎么办」一列：原因码告诉人为什么被拦，这里告诉人该去核对什么。
+  # 随 summary.review_actions 与 fields.csv 一起导出，下游/审计不必再猜码的含义。
+  # 验收 review_contract.every_hard_reason_has_action 会确保 hard_abstain_reasons 里
+  # 每一个码都在这里有条目——加了新硬性原因却忘写文案，验收会直接失败。
+  review_actions:
+    GROUNDING_MISSING: 该字段没有坐标，先在原图上找到值再录入，不要凭上下文补
+    LOW_OCR: OCR 置信度低，逐字比对原图，重点看数字与形近字
+    LOW_CONFIDENCE: 置信度没过这一档的门槛，逐字核对原图；不对就按原文重录
+    FORMAT_FAIL: 格式不合法，按原文逐字重录，不要改成「看起来合法」的值
+    ENUM_UNKNOWN: 原文写的是「未知/不详」，不是读错——先确认原图确实这么写，再判断这条标志是否影响准入
+    CROSS_FIELD_FAIL: 与同表其他字段勾稽不上，先找出读错的那一个，不要改恒等式
+    EXTRACTOR_CONFLICT: 两条抽取通路值不同，核对行与列的归属，两条都可能是错的
+    AMBIGUOUS_UNIT: 金额单位不明，先在正文找到单位说明（元/万元/百万元）再录入
+    AMBIGUOUS_DATE: 日期不明，按原文逐字录入并核对年份，不要推断
+    UNKNOWN_DOC_TYPE: 文档类型未识别，先确认资料类型，再核对适用字段
+    PARSE_LOW_QUALITY: 解析质量低，整页对照原图复核，不要只看单字段
+    NON_CNY_CURRENCY: 非人民币币种，确认币种后再决定是否入账
+    REQUIRED_EMPTY: 必填为空，确认原图是否真的没有该项；没有就保持空
+    PLACEHOLDER_EMPTY: 原图这一格印的是占位符（--/无/***），不是数值；确认它确实表示「没有」再放行，若是糊字漏读就按原文重录
+    TEMPLATE_MISMATCH: 版式与模板不匹配，确认是否为同类资料后逐字段核对
+    CHAIN_UNRELIABLE: 关联字段不可靠，先复核被引用的那个字段再看本字段
+    SIGN_INFERRED: 金额符号由收支方向推断，核对借方/贷方方向
+    SEAL_OVERLAP: 印章压住取值区域，对照原图辨认被遮挡的字符
+    TABLE_ANOMALY: 表格并框/错列/合并单元格，先分清列再取值，不要整块接受
+    QR_CONFLICT: 二维码与 OCR 读数冲突，两边都要看，由人裁决
+    LOW_RESOLUTION: 页面分辨率不足，放大原图逐字核对
+    LINE_FALLBACK: 无表头的行回落取值，核对行名与年度列右边缘是否对齐
+    MATRIX_FALLBACK: 矩阵回落取值，核对区段标题、合计行与列数
+    LOCAL_RECROP: 局部补读取值，确认补读到的框确实是该标签的值
+    RAW_UNVERIFIED: 声称读到的原文在页面上找不到，核对是否为抽取器拼出来的字
+  # 交付审计（`docpipe/deliveryaudit.py`）的判据，不参与任何判决，只复查已经写出来的产物。
+  # 铁律「不把解析层输出当最终产品」原来只靠 run.py 的调用顺序保证：顺序在代码里看得见，
+  # 在产物里看不见——哪天新增一个出口绕过判决层直接写抽取结果，字段照样有值有溯源，
+  # 只有「这一格有没有被判过」静默消失。这里把那句话翻译成能在产物上核对的三件事。
+  delivery:
+    # 每一格交付字段必须带的键。查**键在不在**，不查值好不好：decision/confidence/
+    # review_reasons 由判决层写（trust.decide_field），grounding 由抽取层写。
+    # 少一个键就等于那一层没碰过这一格。
+    required_field_keys:
+      - decision
+      - confidence
+      - review_reasons
+      - grounding
+    # 判决层会产出的状态。出现别的写法（accepted / auto / 空串），说明有人在导出层
+    # 另发明了一套判决词汇；改这里等于改判决层的词汇表，必须连带改 trust.py。
+    decided_states:
+      - accept
+      - review
+    # 覆盖下限：交付目录里至少要审到这么多份文档、这么多格，才算这一轮真的审了。
+    # 扫空的审计和干净的审计输出一样，所以门槛写在配置里，由验收与 CLI 退出码共同咬住。
+    min_delivered_documents: 5
+    min_delivered_fields: 1000
+    # 第四问（`--zip` 交付包）的判据：包里的 export_manifest.json 必须逐字段交代装了哪些
+    # 文件、每个文件的字节数与 sha256。少一个键、清单与包内成员对不上、哈希验不出这份
+    # 内容、或打包时拒收过遗留文件，都算「交付物说不清自己是什么」。
+    required_manifest_keys:
+      - source_out
+      - workspace
+      - exported_at
+      - document_count
+      - overall
+      - report
+      - contents
+      - member_count
+      - members
+      - skipped_members
+    # 至少要记到这么多条成员才算真审到了这个包——0 违规和 0 成员的输出长得一模一样。
+    # 出厂交付包实测 25 条（网页版 + 怎么看.txt + 10 份文档 JSON + CSV + 汇总 + 10 份复核
+    # 台账 + 清单自身）；下限留 20 是给「少一份文档」的改动留余量，不是给空包留余量。
+    min_package_members: 20
+    # 第五问（人工修正对账）的判据：`review/*.review.jsonl` 与 `final/` 必须逐格对得上。
+    # 这是 §7.2 规定的台账契约键——少一条就变成「有人签了字，但查不到是谁、什么时候、
+    # 原值是什么」，而成品里那一格照样带着「已复核」的样子出厂。
+    required_review_keys:
+      - document_id
+      - field_path
+      - original_value
+      - action
+      - reviewer
+      - timestamp
+    # 台账动作 → 成品里的复核状态。这一处定词：写入侧（serve 的收单闸门）、导出（谁有权
+    # 换值、落成哪个状态）、折池（calibrate 把哪条判决算成人工修正）都读它，界面上哪一格算
+    # 「已修正」也读它——只是两个界面（复核台 app.js、单文件网页版）读不到 YAML，走载荷里的
+    # `review_vocab`；它们各自只留一处写着出厂值的兜底，验收检查盯住兜底与这里逐字相同。
+    review_state_pairs:
+      accept: reviewed_accept
+      correct: reviewed_corrected
+    # 只有这些动作有权把机器值换成人的值；表外的动作改了成品值就是越权。
+    # 这里写了动作表以外的词＝配置自己打架：流水线当场报错，审计记成
+    # `value_changing_action_unpaired`（该改的是这张表，不是签字的人）。配成空表是「没有任何
+    # 动作改值」这句真话，不会被当成没配而偷偷退回出厂值。
+    value_changing_actions:
+      - correct
+    # 复核侧的三层计数键：汇总里的键 → 它数的是哪个状态（null = 凡带复核状态的格都算）。
+    # 键名本身是产物契约（CSV 列、final_summary、界面筛选都靠它），改动作词时不跟着动；
+    # 这里只管「这个键数的是哪个状态」。
+    review_count_keys:
+      reviewed_count: null
+      reviewed_corrected_count: reviewed_corrected
+    # 第六问（坐标可核性）的判据。VIII 查的是 `grounding` 这个**键在不在**，验收
+    # `output.accepted_grounding` 查的是 `bbox` 有四元、面积为正；可人在前台点的那一层画的
+    # 是**归一化框**（复核台 app.js 与单文件网页版都按 `bbox_norm` 摆百分比方框），所以
+    # 「有坐标」不等于「看得见坐标」。这三条把前台那一层的依赖写进判据：
+    # drawn_coordinate_keys = 前台画的是哪几套坐标（改名或换一套就必须同步改这里）；
+    # raw_coordinate_key = 抽取层的原始框，用来跟前台那套比「是不是同一个页面尺度除出来的」；
+    # coordinate_tolerance = 归一化写进产物时四舍五入的半个刻度，两套坐标的一致性只允许
+    # 这么大的一点误差（阈值出码：代码里不许再写 5e-05）。
+    drawn_coordinate_keys:
+      - bbox_norm
+    raw_coordinate_key: bbox
+    coordinate_tolerance: 0.00005
+    # 第七问（门自证）的判据。门槛只在判决层读一次，产物里留下的是 `confidence` 与 `decision`
+    # 两个数，中间没有人再对一遍：新增出口硬写 accept、导出层覆写 confidence、某格的 risk 落进
+    # 没配置的档，六问照旧全绿，只有「这一格凭什么放行」静默变成没有出处的数字。这一问按产物
+    # 里的 path/risk/confidence 独立查一遍 thresholds，不叫 config.risk_threshold——那个函数改了
+    # 口径这里会跟着改，两边就永远对得上了。两张词汇表各管各的：gate_states 决定谁有解释义务
+    # （review 的格子本来就低，那是它进队列的原因，不是矛盾），reason_free_states 决定谁必须
+    # 不挂着理由；两件事塞进一个键时，换掉解释对象会让「判决与理由是不是同一次写的」这一半
+    # 静默停摆。
+    gate_states:
+      - accept
+    reason_free_states:
+      - accept
+    gate_confidence_key: confidence
+    gate_reason_key: review_reasons
+
+# 只用于测量，不参与生产决策；这些数字不进验收门槛。
+diagnostics:
+  # P0-5b 前置：把同一批合成文档按 dpi × JPEG 质量栅格化，关掉页级分辨率门跑真实链路，
+  # 按 (dpi, JPEG, 风险档) 归因「放回自动化能保住多少、会新增多少静默错误」。
+  # 分级档位的边界只能在这张表面前定，不能反过来调低既有阈值凑数。
+  # 2026-10-25 这一次跑完的结论已写进 parsing.page_quality.risk_min_dpi 的注释：
+  # 门槛（150）以下实测只有 120.1 一档，而那一档没有任何风险档能零错值放行，门保持关闭。
+  resolution_sweep:
+    dpis: [120, 150, 180, 220, 260, 300]
+    documents_per_cell: 4
+    # 两根轴都要扫：同为实测 120.1dpi，JPEG 85 只有 1 个 free_text 错值，JPEG 55 有 37 个
+    # 静默错误——只看 dpi 一根轴会把门限定错，门又看不出压缩痕迹。
+    jpeg_qualities: [55, 85]
+    # 角度只留一点点，避免每档踩到不同的矫正残差。
+    angle: 0.2
+    doc_types: [BUSINESS_LICENSE, BANK_STATEMENT, INCOME_STATEMENT,
+                CREDIT_REPORT_ENTERPRISE]
+
+calibration:
+  method: logistic_regression_isotonic
+  artifact: work/calibration.json
+  # 字段样本足够时按字段分层，不足 30 条时回退到文档类型，避免冷启动字段
+  # 全部被 0.94 上限压到复核队列。
+  sample_grouping: field_auto
+  min_samples_per_field: 30
+  low_sample_confidence_cap: 0.94
+  # 两类票据缺少批量校准样本。缺少校准产物时也使用小样本上限。
+  heuristic_cap_doc_types: [VAT_INVOICE, CUSTOMS_VAT_PAYMENT]
+  min_total_samples: 60
+  n_splits: 5
+  # SCENARIO §6.2 要求按文档分组做交叉验证（同一文档的字段不得跨折）。这里写死 true 不是
+  # 装饰键：置 false 会在拟合前直接报错，而不是静默改成会泄漏的 KFold。
+  group_by_document: true
+  # 置信度有多少是真正的概率、多少只能用来排序，界面/报表/导出页按下面两句提示。
+  reliability_notes:
+    probability: "置信度来自已校准模型，可当概率读。"
+    ordinal: "部分字段样本不足或未校准：这些置信度只能用来排序，不能当概率读。"
+  # P0-2 合成负例：真实错误样本只有个位数，校准器学不到"看起来正常但内容错"。
+  # 这里用三类可控扰动补负例（只在训练/评估校准器时使用，不进入业务数据）：
+  # near_miss 近似标签、misgrounded 坐标错位、wrong_value 明显错值。
+  # 负例与来源字段绑定同一 document_id，交叉验证按文档分组，不会跨折泄漏。
+  synthetic_negatives:
+    enabled: true
+    seed: 20261025
+    target: 120
+    near_miss_share: 0.45
+    misgrounded_share: 0.35
+    wrong_value_share: 0.20
+    # 同一字段最多生成几条负例，避免个别字段把样本分布刷歪。
+    max_per_field: 2
+  # 可靠性曲线分箱：左闭右开，最后一箱含上限。
+  reliability_bins: [0.0, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 1.01]
+  heuristic_weights:
+    ocr_conf: 0.30
+    rule_exact: 0.22
+    format_valid: 0.16
+    table_score: 0.10
+    cross_field_score: 0.16
+    grounding_present: 0.06
+  # 主动学习闭环：把复核台账（review/*.review.jsonl）里的人工终局判定折回校准样本池。
+  # accept=自动值是对的（正例），correct=被人重录过（同一条特征向量的负例）。
+  # 出厂关着：真实复核量没起来之前，让几条修正去动生产置信度就是刷数字。
+  learn_from_review: false
+  review_dirs: [out/user]
+  # 少于这个条数整批不接（产物里记 review_loop.enabled=false），因为难例天生扎堆，
+  # 少量样本会把可靠性曲线拉成噪声。
+  review_min_samples: 20
+  # 台账上的判决对着的是当时那一版产物；结果目录重跑过就可能值与判决都变了。
+  # drop=对不上的不折进池（出厂），keep=照旧全折但把各类条数写进产物，两条都不静默。
+  review_drift: drop
+  # SCENARIO §6.2 第 2～6 条在**产物侧**的复核口径（`docpipe.modelaudit` 只读）：
+  # 逐格按产物自带的 coef / intercept / isotonic 重算 confidence，再与交付值对账。
+  artifact_contract:
+    # 置信度按 3 位小数落盘，半 ULP 窗；超出这个差就是「这个数不是模型给的」。
+    confidence_tolerance: 0.0005
+    min_isotonic_points: 2
+    # §6.2 第 3 条要求折外分数覆盖每份文档；出厂产物只覆盖 6/10，如实报不追责。
+    oof_coverage_target: 1.0
+    min_delivered_fields: 100
+
+output:
+  json_indent: 2
+  csv_encoding: utf-8-sig
+  # SCENARIO §8.4 的「列固定为」11 列，顺序即契约；`docpipe.csvaudit` 逐字对账。
+  csv_columns: [document_id, doc_type, field_path, value, value_type, confidence,
+                decision, page, bbox, extractor_id, review_reasons]
+  # 已登记的三列扩展（复核动作 / 值改写 / 流水链证据），只许追加在契约列之后。
+  csv_appendix: [review_actions, value_rewrite, chain_evidence]
+  # SCENARIO §8.1 单文档 JSON 在契约键之外的已登记扩展（点号路径，`fields.*` = 每个字段对象）。
+  document_extra_keys: [timing, review_summary, source.path,
+                        document_quality.photo_flags, document_quality.low_resolution_pages,
+                        document_quality.rectified_pages, document_quality.grounding_dropped,
+                        document_quality.preprocess, summary.by_confidence_basis,
+                        fields.*.path, fields.*.label, fields.*.required, fields.*.risk,
+                        fields.*.status, fields.*.signals, fields.*.meta,
+                        fields.*.confidence_basis, fields.*.calibration_samples,
+                        fields.*.rewrite]
+  # §8.1 要求时间戳带时区偏移；这个值是唯一出处。
+  timestamp_offset: "+08:00"
+
+# 人看的交付物：单文件 HTML，双击即开、离线可读、可打印成 PDF。
+report:
+  file_name: 查看结果.html
+  title: 信贷资料结构化结果
+  # 把原文页内嵌进 HTML（JPEG），点字段行即可定位到页面上的位置。
+  embed_pages: true
+  page_dpi: 96
+  page_jpeg_quality: 62
+  # 每份文档最多内嵌几页，控制文件体积；0 表示不限制。
+  max_pages_per_document: 8
+  # 单文件报表体积上限（MB）。超出时按 degrade_ladder 从轻到重逐级压缩原文页，
+  # 保证双击打开依然很快；0 表示不限制。
+  max_size_mb: 12
+  # 每一级覆盖上面的页面参数；最后一级关掉内嵌，只留字段与定位坐标。
+  degrade_ladder:
+    - page_jpeg_quality: 48
+    - page_jpeg_quality: 40
+      max_pages_per_document: 3
+    - page_jpeg_quality: 36
+      max_pages_per_document: 1
+    - embed_pages: false
+  # 字段按风险分组归到下面这些中文小节；未列出的风险进 fallback_group。
+  group_order: [主体与证件, 日期与期间, 金额与统计, 其他信息]
+  fallback_group: 其他信息
+  risk_groups:
+    identity: 主体与证件
+    party_name: 主体与证件
+    date: 日期与期间
+    monetary: 金额与统计
+    count: 金额与统计
+    enum_flag: 其他信息
+    free_text: 其他信息
+    optional_low_risk: 其他信息
+  table_titles:
+    transactions: 交易明细
+    income: 利润表明细
+    line_items: 发票明细
+    tax_items: 海关缴款明细
+
+ingest:
+  # 允许导入的资料类型（小写扩展名，不含点）。PDF 优先走文本层，图片整页走 OCR。
+  allowed_suffixes: [pdf, png, jpg, jpeg, bmp, tif, tiff, gif, webp]
+  # 图片等比缩到最长边不超过该像素再交给解析层，避免超大手机照片拖慢 OCR。0 表示不缩放。
+  image_max_side: 2600
+  # 这些类型的多余帧按「下一页」处理（扫描仪常出多页 TIFF）；动图（gif/webp）只取第一帧。
+  multiframe_suffixes: [tif, tiff]
+  # 允许直接把 .zip 拖进界面：本机解开压缩包，逐个按文件头复检类型，只把
+  # PDF/图片放进收件箱，压缩包本身不落盘。条目名只取文件名，目录层级与 ../ 一律丢弃。
+  zip_allowed: true
+  zip_max_entries: 200        # 一个压缩包最多解出几份，超了整包拒绝，避免误把整块硬盘打包进来
+  zip_max_total_mb: 500       # 压缩包内声明的解压总大小上限
+  zip_max_ratio: 40           # 单个条目解压后/压缩前体积比上限，超过即判定为异常压缩包并中止
+
+# 拍照/扫描件预处理。enabled=false 时完全退回「原图直接进 OCR」。
+# 几何矫正（倾斜、透视）在归一化那一步做完，OCR、复核渲染、报表看到的是同一张页面，
+# 字段坐标因此不需要再做换算；收件箱里的原始文件始终不改。
+preprocess:
+  enabled: true
+  geometry:
+    # 角度搜索与轮廓检测都在缩到该边长的小图上做，矫正结果再应用回原尺寸。
+    analyze_max_side: 900
+    deskew: true
+    # 先在小图上把角度搜到 ±search_range_degrees，只有落进 max_deskew_degrees 才真的旋转；
+    # 超过上限说明不是「拍歪」而是「斜着拍了一页」，半拉正的页面比原图更难读，只标记不硬转。
+    # 实测（营业执照页 200dpi 拍照）：15° 拉正后 12 个字段全对，卡在 12° 时 10 个字段错。
+    search_range_degrees: 24
+    max_deskew_degrees: 18
+    search_step_degrees: 0.5
+    min_deskew_degrees: 0.6
+    # 投影峰值/中位数低于该比值说明没有可靠的行文信号（空白页、以图片为主），跳过矫正。
+    min_projection_contrast: 1.35
+    # 旋转前峰值至少是不旋转时的这么多倍才算「真的拍歪」。实测：歪 7° 的页面 ~17 倍，
+    # 强透视页找不到唯一正确角度，伪峰值只有 ~1.3 倍——对它旋转只会更糟。
+    min_skew_gain: 1.5
+    min_foreground_pixels: 400
+    rectify: true
+    # 找到接近矩形的文档轮廓、而且歪得明显才做透视拉正：面积占比、四角与直角的偏差、
+    # 轮廓贴边（说明页面被拍到框外）、拉正后的长宽比都在下面这些门槛上把关。
+    min_quad_area_ratio: 0.45
+    polygon_epsilon_ratio: 0.02
+    min_corner_deviation_degrees: 9
+    min_border_margin_ratio: 0.012
+    # 页面只碰到一条边多半是贴边扫描（发票右缘贴框很常见），两条边以上才判「拍漏了」。
+    partial_min_border_sides: 2
+    # 拉正输出的边长倍数。1.0 会把文档缩小重采样、小字直接糊掉（实测 9 个字段错）；
+    # 1.6 保留细节（实测 0 个字段错）。输出仍然不超过 ingest.image_max_side。
+    warp_output_scale: 1.6
+    min_aspect: 0.5
+    max_aspect: 2.6
+    fill: 255
+  enhance:
+    # 只改变交给 OCR 引擎的像素，复核界面与报表里的原文页仍是拍摄原样。
+    # 印章抑制用「三通道取最大」：红章、蓝章都读成纸白，黑色印刷字仍然是黑的。
+    # 判据是通道间跨度（彩章大、墨迹小），不是色相。
+    seal_suppression: true
+    seal_chroma_threshold: 45
+    # 彩色像素占比落在下面区间才认为是印章：太少没必要，太多说明整张偏色（暖光白平衡）。
+    min_colored_ratio: 0.004
+    max_colored_ratio: 0.3
+    # 骑缝章残片专用页级下限：跨页处的章只有半边或一角入画，整页彩色占比落到主门之下
+    # （实测四分之一章 ≈ 0.0028），主门会静默跳过。低于主门但高于本门时只认贴图片边缘的
+    # 色块；内部彩色小块（图标、红字）照旧被拒。容差按图片长宽比例、两轴各算。
+    edge_seal_min_colored_ratio: 0.0015
+    edge_seal_margin_ratio: 0.005
+    # 记下印章在页面上的位置（供「章压住字段就强制复核」用）：先把彩色像素膨胀合并成块，
+    # 环形章会连成一片，章心的字也算被压住；面积占比在区间外的碎片忽略。
+    seal_merge_radius: 15
+    min_seal_area_ratio: 0.002
+    max_seal_area_ratio: 0.5
+    max_seal_regions: 12
+    # 印章候选先做形态学开运算：发票的红框、表格红线又长又细，开运算只留下块状色斑。
+    # 再按长宽比与包围盒上限筛掉整页偏色；只有通过筛选的章体像素才做「三通道取最大」，
+    # 章外的红字与红框保持原样（整页取最大会把销售方税号那类红字一起擦掉）。
+    seal_open_kernel: 3
+    seal_min_aspect: 0.25
+    seal_max_aspect: 4.0
+    max_seal_bbox_ratio: 0.25
+    seal_mask_dilate: 9
+    # 反光带压制：只动「够亮、不带颜色、而且带内笔画已被冲淡到接近纸面」的成片高光，
+    # 把带内的灰度跨度按纸面标准拉回去，字就重新站得起来。原图文件不动，只改交给 OCR 的像素。
+    highlight_suppression: true
+    # 亮度高于该值、通道跨度低于该值的像素才算反光候选（跨度高的是彩章和暖光偏色，另走印章那条路）。
+    highlight_min_luma: 232
+    highlight_max_chroma: 14
+    # 种子：一个「行高」窗口里纸墨跨度塌到该值以下、够亮、不带颜色的地方。窗口按 900px 分析图计。
+    highlight_local_window: 25
+    highlight_max_local_range: 70
+    # 区域里至少要还剩这么多级跨度，才说明里面确有被冲淡的字；纯空白页边的跨度接近 0，不救。
+    highlight_min_band_range: 8
+    # 单个塌掉区域占整页的比例区间：低于下限忽略碎片，高于上限说明整页过曝——
+    # 那属于「拍废了」，硬拉伸只会把纸面噪点放大成假墨，交给 PHOTO_WASHED 提示重拍。
+    min_highlight_area_ratio: 0.01
+    max_highlight_area_ratio: 0.55
+    # 带外跨度 / 带内跨度 低于该值认为「没什么可救」（干净页的字缝、纸边都在 1 附近），整页跳过。
+    highlight_min_gain: 1.8
+    # 拉伸倍数上限：再大就是把纸面噪点放大成假笔画了。实测 90% 反光的营业执照拍照页需要 ~4.4 倍。
+    highlight_max_gain: 6
+    # 目标纸面亮度 = 带外纸面亮度 + 该提升量，留一点余量，避免拉过头让带子看起来像一片浅灰底。
+    highlight_local_lift: 16
+    # 估计局部纸面亮度用的高斯半径（按 900px 分析图计，不是原图尺寸）。
+    highlight_blur_sigma: 12
+    # 字迹与纸面的灰度跨度低于该值就补对比度（正常页 127-157，逆光/发白 <100）。
+    contrast_lift: true
+    min_luma_range: 100
+    clahe_clip: 2.2
+    clahe_tiles: 8
+    # 纸面灰度中位数低于该值就提亮（正常页 254-255，昏暗拍照 <140）。
+    brightness_lift: true
+    min_median_brightness: 140
+    gamma_floor: 0.55
+  quality:
+    # 低于这些门槛就在资料上打「建议重拍」提示，不会静默当成正常资料。
+    # 清晰度按 900px 分析图上的拉普拉斯方差衡量：正常页 950-2700，轻糊仍可用 ~400，
+    # 明显糊掉 ~70，完全不可读 ~2。
+    min_sharpness: 220
+    min_median_brightness: 140
+    # 最暗 1% 像素仍高于该值说明字迹太浅（正常页 98-128，反光/发白 >200）。
+    max_ink_luma: 165
+    min_luma_range: 100
+    min_ocr_mean_confidence: 0.72
+    # 手指遮挡只标记、不硬修：压住的那块像素本来就没有信息，猜出来比留白更危险。
+    occlusion_check: true
+    # 四条同时成立才报，缺一条就是别的东西：有颜色（≥印章那条的跨度但比它松）、
+    # 比本页纸面暗、够大、够长条、且贴到画面边缘（手指一定伸出框外）。
+    occlusion_min_chroma: 26
+    occlusion_min_darker: 24
+    occlusion_min_area_ratio: 0.03
+    occlusion_min_aspect: 2.4
+    occlusion_max_area_ratio: 0.55
+    # 贴边容差：拉正后的白边会让手指差几个像素碰不到边，按短边的比例放宽。
+    occlusion_border_ratio: 0.03
+
+ui:
+  host: 127.0.0.1
+  port: 8765
+  port_scan_max: 8785
+  render_dpi: 150
+  max_upload_mb: 60
+  # 一次拖入整个文件夹时的文件数上限，超出的跳过，避免把整块硬盘卷进来。
+  max_import_files: 200
+  # 界面删除的资料先进 work/trash/<时间戳>/，只有同时满足下面两条才继续保留：
+  # 在最近 trash_keep_runs 次之内、且比 trash_keep_days 天更新；每次删除后自动清理更早的。
+  trash_prune: true
+  trash_keep_runs: 20
+  trash_keep_days: 30
+  workspaces:
+    - {id: user, label: 我的资料, out: out/user}
+    - {id: dev, label: 示例数据, out: out/dev}
+    - {id: holdout, label: 验收数据, out: out/holdout}
+
+# 「全链路本地/离线」是铁律，不是习惯：下面这些名单决定 `docpipe.offlineaudit` 判什么算
+# 「走出本机」。加一个 CDN 字体、把 OCR 模型改成在线下载、在单文件网页版里塞一张远程图，
+# 功能全都正常，数据却出了域——所以这三类判据必须有地方配，也必须有地方被复查。
+security:
+  offline:
+    # 只有这些主机算本机。回环地址之外的任何主机名都是违规，包括内网 IP。
+    loopback_hosts:
+      - 127.0.0.1
+      - localhost
+      - ::1
+    # 带这些协议的字符串字面量与资源引用一律算「要出本机」，主机不在上面的名单就报。
+    blocked_schemes:
+      - http
+      - https
+      - ftp
+      - ftps
+      - sftp
+      - ws
+      - wss
+    # 资源引用（src= / href= / url() / fetch()）里允许的形态：相对路径、片段、data: 内联。
+    inline_schemes:
+      - data
+      - file
+    # 允许发起网络连接的模块，且它自己必须只连回环地址。流水线本体一个都不许出现在这里。
+    network_allowed_modules:
+      - acceptance.py
+    # 交付页面里可能被远程引用的属性/函数，逐个列出来，漏一个就是审计的漏洞。
+    asset_reference_attrs:
+      - src
+      - href
+      - srcset
+      - poster
+      - background
+    asset_url_functions:
+      - url
+      - fetch
+      - importScripts
+      - EventSource
+    # 命名空间声明里的 URL 是标识符不是定位符，永远不会变成一次请求（SVG 的 xmlns）。
+    # 只豁免这些属性名本身：写成 <image xlink:href="http://…"> 仍然会去取远程资源，照报。
+    inert_attrs:
+      - xmlns
+
+doc_types:
+  BUSINESS_LICENSE:
+    label: 营业执照
+    keywords:
+      营业执照: 4
+      统一社会信用代码: 3
+      法定代表人: 2
+      注册资本: 2
+      登记机关: 1
+    tables: {}
+    fields:
+      - {path: bl.company_name, label: 企业名称, aliases: [名称], type: string, required: true, risk: party_name, extractor: label_value, rules: [NON_EMPTY], min_len: 2, max_len: 80}
+      - {path: bl.unified_social_credit_code, label: 统一社会信用代码, type: string, required: true, risk: identity, extractor: regex, pattern: '[0-9A-HJ-NP-RTUW-Y]{18}', rules: [USCC]}
+      # 执照按主体类型换栏名：公司制是「类型」，个体/合伙常写「组成形式」。
+      - {path: bl.entity_type, label: 类型, aliases: [企业类型, 公司类型, 主体类型, 组成形式], type: string, required: false, risk: free_text, extractor: label_value, rules: []}
+      # 《营业执照》8 种版式里负责人一栏的名称随主体类型变化：公司=法定代表人，
+      # 分支机构=负责人，合伙=执行事务合伙人，个人独资=投资人，个体户=经营者。
+      - {path: bl.legal_representative, label: 法定代表人, aliases: [法人, 负责人, 执行事务合伙人, 经营者, 投资人], type: string, required: true, risk: party_name, extractor: label_value, rules: [NON_EMPTY], min_len: 2, max_len: 30}
+      - {path: bl.registered_capital, label: 注册资本, type: decimal, required: true, risk: monetary, extractor: label_value, rules: [POSITIVE]}
+      - {path: bl.establishment_date, label: 成立日期, type: date, required: true, risk: date, extractor: label_value, rules: [DATE]}
+      - {path: bl.business_term_start, label: 营业期限, type: date, required: false, risk: date, extractor: period_range, part: start, rules: [DATE_OPT]}
+      - {path: bl.business_term_end, label: 营业期限, type: date, required: false, risk: date, extractor: period_range, part: end, rules: [DATE_OPT]}
+      - {path: bl.address, label: 住所, aliases: [经营场所, 营业场所], type: string, required: true, risk: free_text, extractor: label_value, rules: [NON_EMPTY], min_len: 5, max_len: 200}
+      - {path: bl.business_scope, label: 经营范围, type: string, required: false, risk: free_text, extractor: label_value, rules: [], min_len: 2}
+      - {path: bl.registration_authority, label: 登记机关, type: string, required: false, risk: free_text, extractor: label_value, rules: [], min_len: 2, max_len: 50}
+      - {path: bl.issue_date, label: 发照日期, aliases: [发证日期], type: date, required: false, risk: date, extractor: label_value, rules: [DATE_OPT]}
+
+  BANK_STATEMENT:
+    label: 银行流水
+    keywords:
+      交易明细: 4
+      开户行: 3
+      交易日期: 3
+      摘要: 2
+      余额: 2
+      流水: 2
+    tables:
+      transactions:
+        headers: [交易日期, 摘要, 对方户名, 对方账号, 收支方向, 交易金额, 余额, 交易流水号]
+        # 银行导出的对公流水常把方向拆成两列金额而不是一个方向列；这两列只参与
+        # 表头识别和取数，不计入 min_columns，也不影响 table_score 的模板覆盖率。
+        optional_headers: [借方发生额, 贷方发生额]
+        aliases:
+          收支方向: [收支, 借贷标志]
+          交易流水号: [流水号]
+          交易日期: [交易时间, 记账日期]
+          借方发生额: [借方金额, 支出发生额, 借方]
+          贷方发生额: [贷方金额, 收入发生额, 贷方]
+        min_columns: 6
+    fields:
+      - {path: bs.account_name, label: 户名, type: string, required: true, risk: party_name, extractor: label_value, rules: [NON_EMPTY]}
+      - {path: bs.account_number, label: 账号, aliases: [银行账号], type: string, required: true, risk: identity, extractor: label_value, rules: [ACCOUNT]}
+      - {path: bs.bank_name, label: 开户行, type: string, required: true, risk: free_text, extractor: label_value, rules: [NON_EMPTY]}
+      - {path: bs.branch_name, label: 开户支行, type: string, required: false, risk: optional_low_risk, extractor: label_value, rules: [], min_len: 2}
+      - {path: bs.currency, label: 币种, type: enum, enum: currency, required: true, risk: enum_flag, extractor: label_value, rules: [CURRENCY]}
+      - {path: bs.period_start, label: 流水期间（起）, aliases: [交易期间, 流水期间], type: date, required: true, risk: date, extractor: period_range, part: start, rules: [DATE]}
+      - {path: bs.period_end, label: 流水期间（止）, aliases: [交易期间, 流水期间], type: date, required: true, risk: date, extractor: period_range, part: end, rules: [DATE]}
+      - {path: bs.opening_balance, label: 期初余额, type: decimal, required: true, risk: monetary, extractor: label_value, rules: [MONEY]}
+      - {path: bs.closing_balance, label: 期末余额, type: decimal, required: true, risk: monetary, extractor: label_value, rules: [MONEY]}
+      - {path: bs.total_income, label: 收入合计, type: decimal, required: false, risk: monetary, extractor: label_value, rules: [MONEY]}
+      - {path: bs.total_expense, label: 支出合计, type: decimal, required: false, risk: monetary, extractor: label_value, rules: [MONEY]}
+      - {path: "bs.transactions[i].txn_date", label: 交易日期, type: date, required: true, risk: date, extractor: table_cell, table: transactions, column: 交易日期, array: bs.transactions, rules: [DATE]}
+      - {path: "bs.transactions[i].summary", label: 摘要, type: string, required: true, risk: free_text, extractor: table_cell, table: transactions, column: 摘要, array: bs.transactions, rules: [NON_EMPTY]}
+      - {path: "bs.transactions[i].counterparty_name", label: 对方户名, type: string, required: false, risk: free_text, extractor: table_cell, table: transactions, column: 对方户名, array: bs.transactions, rules: [], min_len: 2}
+      - {path: "bs.transactions[i].counterparty_account", label: 对方账号, type: string, required: false, risk: identity, extractor: table_cell, table: transactions, column: 对方账号, array: bs.transactions, rules: [ACCOUNT_OPT]}
+      # 借贷双列版式没有方向文字：哪一列有金额就是哪个方向。两列同时有值视为
+      # 版式冲突，宁可不取值（走 REQUIRED_EMPTY 复核）也不猜。
+      - {path: "bs.transactions[i].direction", label: 收支方向, type: enum, enum: direction, required: true, risk: enum_flag, extractor: table_cell, table: transactions, column: 收支方向, column_enum: {借方发生额: 支出, 贷方发生额: 收入}, array: bs.transactions, rules: [DIRECTION]}
+      # 借记（支出）列印的是正数，符号由方向推出来，因此 SIGN_INFERRED 会强制复核；
+      # 单列版式里的符号本来就在文字里，sign_source=text，不受影响。
+      - {path: "bs.transactions[i].amount", label: 交易金额, type: decimal, required: true, risk: monetary, extractor: table_cell, table: transactions, column: 交易金额, fallback_columns: [借方发生额, 贷方发生额], direction_columns: {借方发生额: 支出, 贷方发生额: 收入}, signed_by_direction: true, array: bs.transactions, rules: [AMOUNT]}
+      - {path: "bs.transactions[i].balance", label: 余额, type: decimal, required: true, risk: monetary, extractor: table_cell, table: transactions, column: 余额, array: bs.transactions, rules: [BALANCE]}
+      - {path: "bs.transactions[i].txn_id", label: 交易流水号, type: string, required: false, risk: optional_low_risk, extractor: table_cell, table: transactions, column: 交易流水号, array: bs.transactions, rules: [], min_len: 4}
+
+  INCOME_STATEMENT:
+    label: 利润表
+    keywords:
+      利润表: 4
+      营业收入: 3
+      营业利润: 3
+      净利润: 2
+      营业成本: 2
+    tables:
+      income:
+        headers: [项目, 本期金额, 上期金额]
+        aliases: {}
+        min_columns: 2
+        row_labels: [营业收入, 营业成本, 税金及附加, 销售费用, 管理费用, 研发费用, 财务费用,
+                     其他收益, 投资收益, 信用减值损失, 资产减值损失, 资产处置收益,
+                     公允价值变动收益, 营业利润, 营业外收入, 营业外支出, 利润总额,
+                     所得税费用, 净利润, 综合收益总额]
+        # 年报/集团报表常没有「项目/本期金额/上期金额」表头，也没有框线：
+        # 左侧项目列无表头，右侧直接写「附注 2024 年度 2023 年度」。这种版式
+        # 表格识别拿不到表头锚点，退化为逐行读：年份表头确定两条金额列的右边界，
+        # 行首已知行名定位项目，只接受右边界对齐的金额块。仅用于文本层页面，
+        # 扫描件仍走 OCR + 表格，避免把 OCR 合并框当成单元格。
+        line_fallback:
+          enabled: true
+          engines: [pymupdf_text]
+          header_pattern: '^20\d{2}\s*(?:年度|年)?$'
+          header_merge: [年度, 年]
+          header_merge_gap: 12
+          columns: [本期金额, 上期金额]
+          column_tolerance: 20
+          # 行回落只证明「行名 + 金额列对齐」，没有表头覆盖和框线证据。
+          # 给一半结构分：不触发 TEMPLATE_MISMATCH 永久拒收，校准也能看到
+          # 它比真正的表格行弱，但不会假装两者等价。
+          structural_score: 0.6
+          label_prefixes: [一、, 二、, 三、, 四、, 五、, 六、, 七、, 八、, 九、, 十、,
+                           减：, 加：, 其中：]
+          label_aliases:
+            公允价值变动收益: [公允价值变动损益]
+          stop_labels: [后附的财务报表附注, 此财务报表已于, 法定代表人, 公司负责人]
+    fields:
+      - {path: is.company_name, label: 编制单位, aliases: [企业名称], type: string, required: true, risk: party_name, extractor: label_value, rules: [NON_EMPTY]}
+      - {path: is.statement_period_start, label: 报表期间（起）, aliases: [期间], type: date, required: true, risk: date, extractor: period_range, part: start, rules: [DATE]}
+      - {path: is.statement_period_end, label: 报表期间（止）, aliases: [期间], type: date, required: true, risk: date, extractor: period_range, part: end, rules: [DATE]}
+      - {path: is.currency_unit, label: 单位, type: enum, enum: unit, required: true, risk: enum_flag, extractor: unit, rules: [UNIT]}
+      - {path: is.revenue, label: 营业收入, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 营业收入, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.cost_of_sales, label: 营业成本, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 营业成本, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.taxes_surcharges, label: 税金及附加, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 税金及附加, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.selling_expenses, label: 销售费用, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 销售费用, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.admin_expenses, label: 管理费用, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 管理费用, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.rd_expenses, label: 研发费用, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 研发费用, column: 本期金额, rules: [MONEY_OPT, NON_NEGATIVE]}
+      - {path: is.finance_expenses, label: 财务费用, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 财务费用, column: 本期金额, rules: [MONEY]}
+      - {path: is.other_income, label: 其他收益, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 其他收益, column: 本期金额, rules: [MONEY_OPT]}
+      - {path: is.investment_income, label: 投资收益, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 投资收益, column: 本期金额, rules: [MONEY_OPT]}
+      # 信用/资产减值损失与资产处置、公允价值变动收益是信贷审查判断「利润里有多少
+      # 不是主营赚来的」的关键行；老准则模板没有前两行时留空，不阻断其余行。
+      - {path: is.credit_impairment_loss, label: 信用减值损失, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 信用减值损失, column: 本期金额, rules: [MONEY_OPT]}
+      - {path: is.asset_impairment_loss, label: 资产减值损失, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 资产减值损失, column: 本期金额, rules: [MONEY_OPT]}
+      - {path: is.asset_disposal_gain, label: 资产处置收益, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 资产处置收益, column: 本期金额, rules: [MONEY_OPT]}
+      - {path: is.fair_value_change_gain, label: 公允价值变动收益, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 公允价值变动收益, column: 本期金额, rules: [MONEY_OPT]}
+      - {path: is.operating_profit, label: 营业利润, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 营业利润, column: 本期金额, rules: [MONEY]}
+      - {path: is.non_operating_income, label: 营业外收入, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 营业外收入, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.non_operating_expense, label: 营业外支出, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 营业外支出, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.total_profit, label: 利润总额, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 利润总额, column: 本期金额, rules: [MONEY]}
+      - {path: is.income_tax, label: 所得税费用, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 所得税费用, column: 本期金额, rules: [MONEY, NON_NEGATIVE]}
+      - {path: is.net_profit, label: 净利润, type: decimal, required: true, risk: monetary, extractor: table_row, table: income, row_label: 净利润, column: 本期金额, rules: [MONEY]}
+      # 新准则模板在净利润之后列「其他综合收益的税后净额」与「综合收益总额」；
+      # 综合收益总额是信贷审查里判断净利润有没有被其他综合收益放大的落点。
+      - {path: is.total_comprehensive_income, label: 综合收益总额, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 综合收益总额, column: 本期金额, rules: [MONEY_OPT]}
+      - {path: is.prior_revenue, label: 营业收入, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 营业收入, column: 上期金额, rules: [MONEY_OPT, NON_NEGATIVE]}
+      - {path: is.prior_net_profit, label: 净利润, type: decimal, required: false, risk: monetary, extractor: table_row, table: income, row_label: 净利润, column: 上期金额, rules: [MONEY_OPT]}
+
+  CREDIT_REPORT_ENTERPRISE:
+    label: 企业征信报告
+    keywords:
+      信用报告: 4
+      征信: 3
+      报告编号: 3
+      未结清贷款: 3
+      逾期: 2
+    tables: {}
+    fields:
+      - {path: cr.company_name, label: 企业名称, type: string, required: true, risk: party_name, extractor: label_value, rules: [NON_EMPTY]}
+      - {path: cr.unified_social_credit_code, label: 统一社会信用代码, type: string, required: true, risk: identity, extractor: regex, pattern: '[0-9A-HJ-NP-RTUW-Y]{18}', rules: [USCC]}
+      - {path: cr.report_number, label: 报告编号, type: string, required: true, risk: identity, extractor: regex, pattern: '[A-Z0-9]{8,32}', rules: [REPORT_NO]}
+      - {path: cr.query_date, label: 查询日期, aliases: [报告时间], type: date, required: true, risk: date, extractor: label_value, rules: [DATE]}
+      - {path: cr.report_period_start, label: 报告期间, type: date, required: false, risk: date, extractor: period_range, part: start, rules: [DATE_OPT]}
+      - path: cr.loan_account_count
+        label: 未结清贷款笔数
+        type: integer
+        required: true
+        risk: count
+        extractor: label_value
+        rules: [COUNT]
+        # 征信中心展示样式的「未结清信贷及授信信息概要」按正常类/关注类/不良类/合计
+        # 分 4 组，每组重复「账户数 / 余额」，没有逐格框线。只有子表头序列、合计行
+        # 与数值格数量三者完全对齐时才取；对不上就留空进复核。
+        fallback:
+          extractor: header_matrix
+          section: 未结清信贷及授信信息概要
+          header_sequence: [正常类, 关注类, 不良类, 合计]
+          column_labels: [账户数, 余额]
+          row_label: 合计
+          value_index: 6
+          max_header_lines: 3
+          max_row_gap: 8
+      - path: cr.outstanding_loan_balance
+        label: 未结清贷款余额
+        type: decimal
+        required: true
+        risk: monetary
+        extractor: label_value
+        rules: [MONEY]
+        fallback:
+          extractor: header_matrix
+          section: 未结清信贷及授信信息概要
+          header_sequence: [正常类, 关注类, 不良类, 合计]
+          column_labels: [账户数, 余额]
+          row_label: 合计
+          value_index: 7
+          max_header_lines: 3
+          max_row_gap: 8
+          # 征信报告的金额单位写在「报告说明」里（单位均为万元），不在表格内；
+          # 找不到这条口径就无法折算，宁可标 AMBIGUOUS_UNIT 进复核。
+          unit_from_document: true
+      - {path: cr.overdue_account_count_24m, label: 近24个月逾期账户数, aliases: [近 24 个月逾期账户数], type: integer, required: true, risk: count, extractor: label_value, rules: [COUNT]}
+      - {path: cr.max_overdue_months, label: 最长逾期月数, type: integer, required: true, risk: count, extractor: label_value, rules: [COUNT]}
+      - {path: cr.query_count_3m, label: 近3个月查询次数, aliases: [近 3 个月查询次数], type: integer, required: true, risk: count, extractor: label_value, rules: [COUNT]}
+      - {path: cr.bad_debt_flag, label: 呆账标志, type: enum, enum: flag, required: true, risk: enum_flag, extractor: label_value, rules: [FLAG]}
+      - {path: cr.asset_disposal_flag, label: 资产处置标志, type: enum, enum: flag, required: false, risk: enum_flag, extractor: label_value, rules: [FLAG_OPT]}
+      - {path: cr.guarantee_flag, label: 对外担保标志, type: enum, enum: flag, required: false, risk: enum_flag, extractor: label_value, rules: [FLAG_OPT]}
+      - {path: cr.public_record_count, label: 公共记录条数, type: integer, required: false, risk: count, extractor: label_value, rules: [COUNT_OPT]}
+      - {path: cr.credit_rating, label: 信用等级, type: enum, enum: rating, required: false, risk: optional_low_risk, extractor: label_value, rules: [RATING_OPT]}
+
+  VAT_INVOICE:
+    label: 增值税发票
+    keywords:
+      增值税专用发票: 4
+      电子发票: 3
+      发票号码: 3
+      价税合计: 3
+      购买方: 2
+      销售方: 2
+      开票日期: 2
+      纳税人识别号: 2
+    # 数电发票二维码载荷：01,31,,发票号码,价税合计,开票日期,,校验码
+    # 只用于补空与核对；与 OCR 冲突时进复核，不覆盖 OCR 结果。
+    qr:
+      fields:
+        invoice_number: {index: 3}
+        total_with_tax: {index: 4}
+        invoice_date: {index: 5}
+    tables:
+      line_items:
+        headers: [项目名称, 规格型号, 单位, 数量, 单价, 金额, 税率/征收率, 税额]
+        aliases:
+          项目名称: [货物或应税劳务名称]
+          税率/征收率: [税率, 征收率]
+        min_columns: 5
+        # 首行行名与水印/表头在 OCR 框上常有几像素重叠，判数据行时放宽。
+        header_row_slack: 6
+        # 合计行没有数量和税额列之外的完整结构，交给标量字段单独抽取。
+        row_required: [项目名称, 数量, 金额]
+        stop_labels: [合计, 价税合计, 合同编号, 备注]
+    fields:
+      - {path: vi.invoice_number, label: 发票号码, type: string, required: true, risk: identity, extractor: regex, pattern: '发票号码[:：]?([0-9]{8,32})', group: 1, rules: [INVOICE_NO], qr_field: invoice_number}
+      - {path: vi.invoice_date, label: 开票日期, type: date, required: true, risk: date, extractor: label_value, rules: [DATE], qr_field: invoice_date}
+      - {path: vi.buyer_name, label: 名称, type: string, required: true, risk: party_name, extractor: label_region, occurrence: 1, rules: [NON_EMPTY]}
+      - {path: vi.buyer_tax_id, label: 统一社会信用代码/纳税人识别号, aliases: [纳税人识别号], type: string, required: true, risk: identity, extractor: label_region, occurrence: 1, rules: [TAX_ID]}
+      - {path: vi.seller_name, label: 名称, type: string, required: true, risk: party_name, extractor: label_region, occurrence: 2, rules: [NON_EMPTY]}
+      - {path: vi.seller_tax_id, label: 统一社会信用代码/纳税人识别号, aliases: [纳税人识别号], type: string, required: true, risk: identity, extractor: label_region, occurrence: 2, rules: [TAX_ID]}
+      - {path: vi.total_amount, label: 合计, type: decimal, required: true, risk: monetary, extractor: label_region, value_index: 0, rules: [MONEY]}
+      - {path: vi.total_tax, label: 合计, type: decimal, required: true, risk: monetary, extractor: label_region, value_index: 1, rules: [MONEY]}
+      - {path: vi.total_with_tax, label: 价税合计, type: decimal, required: true, risk: monetary, extractor: regex, pattern: '[（(]小写[)）][￥¥Y]?([\d,]+\.\d{2})', group: 1, allow_unlabeled: true, rules: [MONEY], qr_field: total_with_tax}
+      - {path: vi.contract_number, label: 合同编号, type: string, required: false, risk: optional_low_risk, extractor: label_value, rules: []}
+      - {path: vi.issuer, label: 开票人, type: string, required: false, risk: optional_low_risk, extractor: label_value, rules: []}
+      - {path: "vi.items[i].name", label: 项目名称, type: string, required: true, risk: free_text, extractor: table_cell, table: line_items, column: 项目名称, array: vi.items, rules: [NON_EMPTY]}
+      - {path: "vi.items[i].spec_model", label: 规格型号, type: string, required: false, risk: optional_low_risk, extractor: table_cell, table: line_items, column: 规格型号, array: vi.items, rules: []}
+      - {path: "vi.items[i].unit", label: 单位, type: string, required: false, risk: optional_low_risk, extractor: table_cell, table: line_items, column: 单位, array: vi.items, rules: []}
+      - {path: "vi.items[i].quantity", label: 数量, type: decimal, required: true, risk: count, extractor: table_cell, table: line_items, column: 数量, array: vi.items, rules: [POSITIVE]}
+      - {path: "vi.items[i].unit_price", label: 单价, type: decimal, required: true, risk: monetary, extractor: table_cell, table: line_items, column: 单价, array: vi.items, rules: [MONEY]}
+      - {path: "vi.items[i].amount", label: 金额, type: decimal, required: true, risk: monetary, extractor: table_cell, table: line_items, column: 金额, array: vi.items, rules: [MONEY]}
+      - {path: "vi.items[i].tax_rate", label: 税率/征收率, type: string, required: true, risk: enum_flag, extractor: table_cell, table: line_items, column: 税率/征收率, array: vi.items, rules: []}
+      - {path: "vi.items[i].tax_amount", label: 税额, type: decimal, required: true, risk: monetary, extractor: table_cell, table: line_items, column: 税额, array: vi.items, rules: [MONEY]}
+
+  CUSTOMS_VAT_PAYMENT:
+    label: 海关进口增值税专用缴款书
+    keywords:
+      海关进口增值税: 5
+      专用缴款书: 4
+      缴款书: 2
+      收入机关: 3
+      填发日期: 2
+      缴款单位: 3
+      报关单编号: 3
+      完税价格: 3
+    qr:
+      fields: {}
+    tables:
+      tax_items:
+        headers: [税号, 货物名称, 数量, 单位, 完税价格(¥), 税率(%), 税款金额(¥)]
+        aliases:
+          完税价格(¥): [完税价格, 完税价格（¥）]
+          税率(%): [税率, 税率（%）]
+          税款金额(¥): [税款金额, 税款金额（¥）]
+        min_columns: 5
+        header_row_slack: 6
+        row_required: [货物名称, 税款金额(¥)]
+        stop_labels: [金额人民币, 合计, 申请单位编号, 合同, 缴款期限, 备注]
+        # 完税价格与税率之间没有竖线时 OCR 会并成一个框（6,679,515.0813.0000）；
+        # 两侧必须分别完整匹配下面的模式才拆，且拆分点靠近表头列边界。
+        column_patterns:
+          完税价格(¥): '^\d[\d,]*\.\d{2}$'
+          税率(%): '^\d{1,2}(?:\.\d{1,4})?$'
+    fields:
+      - {path: cv.payment_number, label: 号码, type: string, required: true, risk: identity, extractor: label_region, value_strip_prefix: [No., NO., no.], rules: [PAYMENT_NO]}
+      - {path: cv.issue_date, label: 填发日期, type: date, required: true, risk: date, extractor: label_value, rules: [DATE]}
+      - {path: cv.payer_name, label: 名称, type: string, required: true, risk: party_name, extractor: label_region, occurrence: 1, rules: [NON_EMPTY]}
+      - {path: cv.payer_tax_id, label: 帐号, aliases: [账号], type: string, required: true, risk: identity, extractor: label_region, rules: [TAX_ID]}
+      - {path: cv.bank_name, label: 开户银行, type: string, required: false, risk: optional_low_risk, extractor: label_region, max_value_parts: 2, rules: []}
+      - {path: cv.revenue_authority, label: 收入机关, type: string, required: true, risk: free_text, extractor: label_region, rules: [NON_EMPTY]}
+      - {path: cv.subject, label: 科目, type: string, required: true, risk: free_text, extractor: label_region, rules: [NON_EMPTY]}
+      - {path: cv.budget_level, label: 预算级次, type: string, required: false, risk: optional_low_risk, extractor: label_region, rules: []}
+      - {path: cv.collection_treasury, label: 收款国库, type: string, required: false, risk: optional_low_risk, extractor: label_region, max_value_parts: 2, rules: []}
+      - {path: cv.total_amount, label: 合计, aliases: [合计(￥)], type: decimal, required: true, risk: monetary, extractor: label_region, value_strip_prefix: [Y, ￥, ¥], rules: [MONEY]}
+      - {path: cv.total_amount_cn, label: 金额人民币（大写）, type: string, required: false, risk: free_text, extractor: label_region, rules: []}
+      - {path: cv.declaration_number, label: 报关单编号, type: string, required: true, risk: identity, extractor: label_region, rules: [DECLARATION_NO]}
+      - {path: cv.application_number, label: 申请单位编号, type: string, required: false, risk: identity, extractor: label_region, rules: [APPLICATION_NO]}
+      - {path: cv.contract_number, label: 合同(批文)号, aliases: [合同（批文）号], type: string, required: false, risk: optional_low_risk, extractor: label_region, rules: []}
+      - {path: cv.transport_name, label: 运输工具（号）, aliases: [运输工具(号)], type: string, required: false, risk: optional_low_risk, extractor: label_region, max_value_parts: 2, preserve_spaces: true, rules: []}
+      - {path: cv.bill_of_lading_number, label: 提/装货单号, aliases: [提装货单号], type: string, required: false, risk: identity, extractor: label_region, rules: [BILL_NO]}
+      - {path: cv.payment_deadline, label: 缴款期限, type: date, required: false, risk: date, extractor: label_region, rules: [DATE_OPT]}
+      - {path: cv.transaction_number, label: 交易流水号, type: string, required: false, risk: identity, extractor: label_region, rules: [PAYMENT_NO]}
+      - {path: "cv.items[i].hs_code", label: 税号, type: string, required: false, risk: identity, extractor: table_cell, table: tax_items, column: 税号, array: cv.items, strip_pattern: '^\d{1,3}[.、]\s*', rules: [HS_CODE]}
+      - {path: "cv.items[i].name", label: 货物名称, type: string, required: true, risk: free_text, extractor: table_cell, table: tax_items, column: 货物名称, array: cv.items, rules: [NON_EMPTY]}
+      - {path: "cv.items[i].quantity", label: 数量, type: decimal, required: true, risk: count, extractor: table_cell, table: tax_items, column: 数量, array: cv.items, rules: [POSITIVE]}
+      - {path: "cv.items[i].unit", label: 单位, type: string, required: false, risk: optional_low_risk, extractor: table_cell, table: tax_items, column: 单位, array: cv.items, rules: []}
+      - {path: "cv.items[i].dutiable_value", label: 完税价格(¥), type: decimal, required: true, risk: monetary, extractor: table_cell, table: tax_items, column: 完税价格(¥), array: cv.items, rules: [MONEY]}
+      - {path: "cv.items[i].tax_rate", label: 税率(%), type: string, required: true, risk: enum_flag, extractor: table_cell, table: tax_items, column: 税率(%), array: cv.items, rules: []}
+      - {path: "cv.items[i].tax_amount", label: 税款金额(¥), type: decimal, required: true, risk: monetary, extractor: table_cell, table: tax_items, column: 税款金额(¥), array: cv.items, rules: [MONEY]}
+
+enums:
+  currency:
+    CNY: [人民币, 人民币元, CNY, RMB, 元]
+  direction:
+    income: [收入, 收, 贷, 贷方, 入账]
+    expense: [支出, 付, 借, 借方, 出账]
+  flag:
+    "yes": [是, 有, 存在, 正常, Y, YES]
+    "no": [否, 无, 不存在, N, NO]
+    unknown: [未知, 不详, -]
+  unit:
+    CNY_YUAN: [元, 人民币元, CNY]
+    CNY_WAN_YUAN: [万元, 万, 人民币万元]
+    # 年报合并报表常用「人民币百万元」，抽取时按 1,000,000 折算成元。
+    CNY_MILLION: [百万元, 人民币百万元]
+  rating:
+    AAA: [AAA]
+    AA: [AA, AA+]
+    A: [A, A+]
+
+hard_abstain_reasons:
+  - GROUNDING_MISSING
+  - LOW_OCR
+  - FORMAT_FAIL
+  - ENUM_UNKNOWN
+  - CROSS_FIELD_FAIL
+  - EXTRACTOR_CONFLICT
+  - AMBIGUOUS_UNIT
+  - AMBIGUOUS_DATE
+  - UNKNOWN_DOC_TYPE
+  - PARSE_LOW_QUALITY
+  - NON_CNY_CURRENCY
+  - REQUIRED_EMPTY
+  - TEMPLATE_MISMATCH
+  - CHAIN_UNRELIABLE
+  # 金额符号由借贷方向推断，原图没有负号，必须人工确认。
+  - SIGN_INFERRED
+  # 印章压住了取值所在的那块区域，字迹被遮挡，不能自动接受。
+  - SEAL_OVERLAP
+  # 表格出现疑似合并单元格/列错位片段，受影响行必须人工确认。
+  - TABLE_ANOMALY
+  # 票面二维码与 OCR 读数冲突：两个来源都是原文，但说法不一致，必须人工裁决。
+  - QR_CONFLICT
+  # 页面有效分辨率不足：放大后的糊字可能被 OCR 高置信度读错。
+  - LOW_RESOLUTION
+  # 年报版式没有表头与框线，按行回落取到的值先交人工确认。
+  - LINE_FALLBACK
+  # 征信报告的重表头矩阵没有逐格框线，取到的值先交人工确认。
+  - MATRIX_FALLBACK
+  # OCR 整页漏字，靠标签右侧裁切补读出来的值，识别路径不同于整页 OCR。
+  - LOCAL_RECROP
+  # 声称读到的原文在页面上找不到（逐字回查未命中）：编造信号，必须人工确认。
+  - RAW_UNVERIFIED
+  # 纸上印的是占位符，已被折成空值：这个「空」是机器翻译出来的，语义要人确认。
+  - PLACEHOLDER_EMPTY
+
+# 表格结构独立度量（G4 / P1-6，对标 docTR 的 TableCellMetric 与 PaddleOCR PP-Structure 的 structure_score）。
+# 全是诊断口径：这里没有一个数字参与信任决策，改它不会让任何字段被放行或被拦下。
+evaluation:
+  # SCENARIO §10.1 的三条匹配规则，评估口径只改这里，代码里不留第二份。
+  # 值正确：按 4.2 归一化后「完全相等」——归一化会把金额四舍五入到分，所以 "100.00" 与
+  # "100" 同值，但旧的 ±0.01 容差还会把差一分的 100.01 当成 100.00；容差默认 0，放宽要显式写。
+  # 溯源正确：预测 bbox 中心点在标注 bbox 内，或与标注 bbox 的 IoU ≥ min_iou；
+  # 旧的「任何正重叠就算命中」口径已作废（大框、歪框会被误记成溯源正确）。
+  # 交易行内容键：§10.1 原文只列这三个，direction 不进内容键（它走字段级判等）。
+  match:
+    decimal_tolerance: 0.0
+    min_iou: 0.5
+    center_inside: true
+    transaction_keys: [txn_date, amount, balance]
+  table_structure:
+    # 标注格与检出格的配对门槛用的是「嵌套度」= 交集面积 / 任一格面积（取较大者），不是 IoU。
+    # 理由实测过：pdfplumber 交整列带、segment_table 交贴着字的框，按 IoU≥0.5 配会在 dev 上
+    # 少配 455/1344 格，把「格子找到了、只是框更紧」误判成漏检。
+    cover_threshold: 0.5
+    # 框的贴合度另外报（不进结构判定）：超过这个 IoU 算「框贴得准」，按引擎分开看。
+    strict_iou: 0.9
+    # 每份文档最多留多少条结构错示例，防止诊断 JSON 被上百格明细撑大。
+    max_examples: 20
+  # SCENARIO §9.3：每次评估记录代码版本、配置哈希、样本清单哈希（evaluate 写进报告）。
+  # SCENARIO §9.4：合成集的局限必须写进评估报告；正式上线前至少 20 份真实脱敏样本重校准。
+  provenance:
+    # 真实脱敏样本不足这个数时，报告结论的范围只能是 synthetic_only——合成集只能证明
+    # 坐标/决策/复核闭环/评估方法成立，不许据此宣称真实业务准确率。
+    min_real_samples: 20
+    # 逐字写进每一次评估报告的限制说明。改口径改这里，不在代码里留第二份文案。
+    limitations:
+      - 合成模板不含真实扫描件的印章、装订孔、手写批注、复杂表格线与银行模板差异。
+      - 合成集指标只能证明坐标、决策、复核闭环与评估方法成立，不能证明真实业务准确率。
+      - 正式上线前必须用至少 20 份真实脱敏样本重新校准与评估，阈值与校准器按真实分布重拟合。
+  # SCENARIO §9.1 的语料形状是全部指标的共同分母（每 split 10 份、3/3/2/2、
+  # 5 文本 + 5 扫描、每类至少 1 份扫描、流水 45~60 笔 3~4 页、每 split ≥120 笔）。
+  # 只由 docpipe.corpusaudit 读取（验收 corpus.*），判决链路不读这些数：它们描述
+  # 样本集应当长什么样，不描述单份文档该怎么判。
+  corpus:
+    documents_per_split: 10
+    per_doc_type:
+      BUSINESS_LICENSE: 3
+      BANK_STATEMENT: 3
+      INCOME_STATEMENT: 2
+      CREDIT_REPORT_ENTERPRISE: 2
+    formats:
+      text: 5
+      scan: 5
+    min_scans_per_doc_type: 1
+    statement_rows: {min: 45, max: 60}
+    statement_pages: {min: 3, max: 4}
+    min_transactions_per_split: 120
+  # 新增一类文档「要动几处」的接入契约，由 docpipe.doctypeaudit 逐类型审计（验收
+  # doctype.*）。这里只放两个可调的数：schema 的最低下限，以及哪些类型承诺了合成样本。
+  doc_type_contract:
+    # 每个类型至少这么多必填字段。低于它的 schema 还是草稿：检测权重与表格模板配得再齐，
+    # 也抽不出一个可交付的核心字段。出厂 6 个类型里最少的营业执照有 6 个必填。
+    min_required_fields: 3
+    # 必须同时有合成构建器（synth.SYNTH_BUILDERS）与至少 1 份清单样本的类型。
+    # 发票与缴款书目前只有 schema、抽取与单测夹具，没有合成版面，如实不列；
+    # 列进来就等于承诺「docpipe.synth 跑得出、samples/manifest.json 找得到」。
+    require_synth: [BUSINESS_LICENSE, BANK_STATEMENT, INCOME_STATEMENT,
+                    CREDIT_REPORT_ENTERPRISE]
+
+  # SCENARIO §12.1「统一解析输出」的契约审计，由 docpipe.parseaudit 读（验收
+  # parse_contract.*）。前三个数是覆盖下限：0 违规不许其实是 0 文件。bbox 容差是
+  # 「框算不算越出页/表」的唯一松紧带——文档里的坐标是浮点，判定要留一点余量。
+  parse_contract:
+    min_documents: 5
+    min_pages: 20
+    min_lines: 100
+    bbox_tolerance: 1.0
+  # SCENARIO §6.3 风险档阈值契约：八档阈值、`包含字段` 一列与全局下限都由
+  # docpipe.riskcontract 拿来与 thresholds / 字段 schema 逐条对账（验收 thresholds.*）。
+  # 这里只有一个覆盖下限：0 违规不许其实是 0 行表。
+  threshold_contract:
+    min_tiers: 8
+  # SCENARIO §1.3 成功定义 / §10.3 阶段门槛：五个验收门槛与文档逐值对账（验收 gates.*）。
+  # 这里只有一个覆盖下限：0 违规不许其实是 0 行表。
+  gate_contract:
+    min_stages: 5
+
+# 验收门槛，供 python -m docpipe.acceptance 读取。
+acceptance:
+  min_auto_accept_rate: 0.60
+  max_accepted_error_rate: 0.02
+  max_monetary_accepted_error_rate: 0.01
+  max_accepted_grounding_missing: 0
+  min_grounding_hit_rate: 0.98
+  min_transaction_content_match_rate: 0.98
+  # SCENARIO §6.5 的小样本规矩：已接受字段不足这么多时，指标只是「暂定结论」，
+  # 必须连同置信区间一起看，不许宣称达标。这个数以前硬编码在 acceptance 的代码里。
+  # 判决按每个指标自己的分母算（金额错值率看金额类已接受格数，不看总格数）；分组里没有金额
+  # 字段时这一维记 not_applicable，不拖累判决。没过线就是没过线——样本小只豁免「宣称达标」，
+  # 不豁免失败。
+  min_accept_for_claim: 100
+  # 区间的置信水平，Wilson 的 z 由它换算（不再另写死 1.96）。
+  claim_confidence: 0.95
+  require_review_flow: true
+  require_image_ingest: true
+  require_ingest_flow: true
+  # 验收脚本对本机接口的等待上限（秒）。/api/import/run 会当场跑完整流水线（冷启动实测约 7.5 秒），
+  # 前面几项检查还会占 CPU；写死 10 秒时这一项会偶发 TimeoutError，所以做成可配。
+  http_timeout_seconds: 30
+  # 拍照资料的矫正/压章/判废验收：造一张歪的、一张盖章的、一张糊的照片走完整链路。
+  require_photo_preprocess: true
+  photo_skew_degrees: 7          # 夹具故意拍歪的角度，矫正结果允许 ±1.5°
+  photo_deskew_tolerance: 1.5
+  photo_blur_radius: 6           # 高斯模糊半径，大到肉眼读不了、小到人还能看出是文件
+  photo_expected_flags: [PHOTO_BLUR]
+  # 反光带内的字段数至少要达到「同样光照但没有反光」那张的这么多，才算压制真的救回了内容。
+  photo_glare_field_share: 0.8
+  # 影调改写夹具：整页压暗到「提亮门 + 对比度门都不过」，用来验收旗标一路走到复核台和报表。
+  # 这两个数只是怎么把页面弄暗，判定门限仍然在 preprocess.enhance 里。
+  photo_dark_scale: 0.40
+  photo_dark_offset: 20
+  # 表格异常：夹具里同时放一条跨列片段（列错位）与一个越过相邻列中心的框（横向并框），必须从解析一路带到复核理由。
+  require_table_anomaly: true
+  # 页级分辨率门：把样本按下面的 dpi 栅格化，整页字段必须因为 LOW_RESOLUTION 进复核，
+  # 同一份按 300dpi 栅格化时必须一个字段都不受这条影响。
+  require_page_quality_gate: true
+  page_quality_fixture_dpi: 100
+  # 征信概要矩阵：标签缺失时按「区段标题 + 重复列头 + 行标签」定位取数，
+  # 金额单位必须来自报告正文（万元），位置对不上就整行弃权并交复核。
+  require_credit_matrix: true
+  # OCR 后端必须由 `parsing.ocr_engine` 决定：换成 `null` 时这一页必须真的没有 OCR 证据，
+  # 写没注册的名字必须报错（悄悄退回默认引擎会让指标看着正常、实际读的是别的东西）。
+  require_ocr_engine: true
+  # OCR 漏掉孤立单字时，标签右侧裁切补读必须能把真实扫描件里的值补回来，
+  # 且补出来的值不能被自动接受。
+  require_ocr_recrop: true
+  # 硬性复核原因码必须在复核台有中文文案：新增原因却忘了界面标签，
+  # 人看到的就是裸代码（P0-8 的 MATRIX_FALLBACK 就是这么漏掉的）。
+  require_reason_ui_labels: true
+  # EXTRACTOR_CONFLICT 是 SCENARIO 里的硬性原因，配置写的备选通路必须有实现：
+  # 干净样张要能拿到第二通路证词且不报冲突，把单元格换成邻列的数必须进复核。
+  require_extractor_crosscheck: true
+  # 编造率回查不能是装饰：干净样张要零命中，把原文换成页面上没有的串要报出来，
+  # 开关打开后必须进复核。默认只做指标、不改判决（标注集实测零误报前不开）。
+  require_raw_text_audit: true
+  # 拒绝契约：每个硬性原因都要有一句「该去核对什么」，并且这句话真的出现在复核台、
+  # out/fields.csv 与 final/final_fields.csv 三个出口上（P1-7）。
+  require_review_contract: true
+  # 值改写披露：单位折算（万元→×10,000）与正负号（按收支方向列印的字判的）都是抽取
+  # 做过的改写。这句话要由 meta 现算，并真的出现在 payload、out/fields.csv、复核台与
+  # 单文件网页版四个出口上；只写「系统换算过」不算数，必须点名纸面上的依据（P1-4f）。
+  require_value_rewrite_disclosure: true
+  # 流水链判决要说清依据：CHAIN_UNRELIABLE 过去只有一个码，人不知道是 6 行里错 5 行
+  # 还是末行对不上期末。这句话由链诊断现算（四种触发各有一句），健康流水一个字不出，
+  # 并要真的出现在复核台、out/fields.csv、final/final_fields.csv 与单文件网页版四个出口。
+  require_chain_disclosure: true
+  # 样本清单冻结（SCENARIO 第 109 行）：清单里的 sha256 必须与磁盘一致；内容变了必须升
+  # manifest 的 version 并重登记基线（`python -m docpipe.samplefreeze --write`）。
+  require_sample_freeze: true
+  # 复核修正要能变回校准样本：accept/correct 的判决方向、最后一次判定优先、
+  # 样本不足整批不接、开关关着时一个目录都不扫（P1-8）。
+  require_review_loop: true
+  # 表格结构独立度量（P1-6 / G4）：标注格与检出格配对后必须能算出这份分片的结构分，
+  # 干净分片要零错格；结构分只做诊断，不参与任何字段的自动接受。
+  # 阈值在 evaluation.table_structure 里，不在这里。
+  require_table_structure: true
+
+# SCENARIO §5.4 跨文档一致性表：逐条照抄契约里的「失败处理」用词与参与比对的字段路径。
+# `enforced` 是代码今天真会发出的判决；false 表示这一条由别的规则承担、或契约本身就声明不做，
+# 写在这里是为了让「表里有、代码没有」变成看得见的数据，而不是沉默的事实。
+cross_document:
+  rules:
+    V-X-01:
+      severity: warn
+      review: true
+      enforced: true
+      paths: [bl.company_name, bs.account_name, is.company_name, cr.company_name]
+    V-X-02:
+      severity: fail
+      review: true
+      enforced: true
+      paths: [bl.unified_social_credit_code, cr.unified_social_credit_code]
+    V-X-03:
+      # 账号全文一致由 V-BS-05 承担，户名与执照名称一致由 V-X-01 承担。
+      # 契约只写「fail（账号）/ warn（户名）」，没写「复核」——fail 由通用规则强制复核，
+      # warn 不加码，配置里 claimed 复核就是造假。
+      severity: fail
+      review: false
+      enforced: false
+      paths: [bs.account_number]
+    V-X-04:
+      # 利润表期末 vs 征信查询日：归组口径与 V-X-01 相同（名称归一化后相同＝同一主体），
+      # 配不上对不判。契约这一格只有「warn」，没有复核义务。
+      severity: warn
+      review: false
+      enforced: true
+      paths: [is.statement_period_end, cr.query_date]
+    V-X-05:
+      # 契约本身声明「不做金额强校验」，这里只登记「不参与决策」。
+      severity: none
+      review: false
+      enforced: false
+      paths: []
