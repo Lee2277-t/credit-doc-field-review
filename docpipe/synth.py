@@ -35,10 +35,25 @@ FONT_FILE = Path("C:/Windows/Fonts/simsun.ttc")
 BOLD_FONT_FILE = Path("C:/Windows/Fonts/simhei.ttf")
 FONT = "F0"
 FONT_BOLD = "F1"
-_FONTS = {
-    FONT: fitz.Font(fontfile=str(FONT_FILE)),
-    FONT_BOLD: fitz.Font(fontfile=str(BOLD_FONT_FILE)),
-}
+_FONT_CACHE: Dict[str, "fitz.Font"] = {}
+
+
+def _font(name: str) -> "fitz.Font":
+    """字体等真正要生成 PDF 时才打开。
+
+    这两行原来写在模块顶层，后果是**任何一次 import docpipe.synth 都会去开 C:\\Windows\\Fonts**
+    ——在没有宋体/黑体的机器上（CI、非 Windows）连 import 都过不去，而绝大多数调用方
+    只是借用这里的常量。缺字体时给一句能照着做的错，而不是 `FzErrorSystem code=2`。
+    """
+    if name not in _FONT_CACHE:
+        path = BOLD_FONT_FILE if name == FONT_BOLD else FONT_FILE
+        if not path.is_file():
+            raise RuntimeError(
+                f"生成合成语料需要字体 {path}，这台机器上没有。"
+                "装好宋体/黑体，或把 FONT_FILE / BOLD_FONT_FILE 指到可用的字体文件。"
+            )
+        _FONT_CACHE[name] = fitz.Font(fontfile=str(path))
+    return _FONT_CACHE[name]
 SEED = 20261024
 
 COMPANY_PREFIXES = ["示例华信", "示例恒达", "示例远航", "示例嘉禾", "示例致远", "示例启明"]
@@ -89,7 +104,7 @@ def _new_page(doc, width: float = A4_WIDTH, height: float = A4_HEIGHT):
 
 
 def text_width(text: str, size: float, font: str = FONT) -> float:
-    return float(_FONTS[font].text_length(text, size))
+    return float(_font(font).text_length(text, size))
 
 
 def fit_size(text: str, max_width: float, base: float, minimum: float = 5.0) -> float:
